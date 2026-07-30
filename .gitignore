@@ -1,6 +1,10 @@
 node_modules/
 dist/
-.env
-.env.local
 *.log
 .DS_Store
+
+# Ignore every .env variant anywhere in the tree, including supabase/.env used
+# for `supabase secrets set --env-file`. The example file is the one exception.
+.env
+.env.*
+!.env.example
