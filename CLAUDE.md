@@ -1,7 +1,8 @@
 # Schreibwerkstatt — agent guidelines
 
-Personal German writing-practice app for a single user. Local-first Vue 3 + Vite SPA,
-no backend, no auth, no deployment. Read `README.md` for the session flow.
+Personal German writing-practice app for a single user. Vue 3 + Vite SPA on GitHub
+Pages, with Supabase for auth, data, and a model proxy. Read `README.md` for the
+session flow.
 
 ## The point of the app
 
@@ -27,6 +28,14 @@ the pedagogy below is not preference, it is the reason the app exists.
   errors while the real gaps stay invisible. Generated tasks carry explicit structural
   requirements. Naming a German trigger word (`weil`) is fine; showing the structure
   in use is not.
+- **Vocabulary is given; grammar is earned.** A generated task ships a small `glossary`
+  of the content words its situation forces, collapsed by default in the UI. Missing
+  lexis causes avoidance exactly as reliably as missing structure — a writer who can't
+  say "overflowed" writes a safer sentence and takes the obligated pattern with it —
+  and lexis is Garten's job, not this app's. Entries are dictionary forms only. The
+  article is fine (a noun's gender is vocabulary); an inflected form is not (agreement
+  is the grammar being practised). `normalizeGlossary` drops anything long enough to
+  be a clause, so the vocabulary list can't become a back door for the answer.
 - **No gamification.** No streaks, points, or celebrations. The reward is the ledger's
   rung trajectory (L4 → L2 → L1 = internalization).
 - **Tasks live in everyday life, with a little whimsy.** Neighbours, markets, pets,
@@ -63,11 +72,12 @@ targets partly to narrow that gap.
   rung 3. Adding or renaming a code touches all three — check every one.
 - `src/lib/ladder.js`, `src/lib/ledger.js`, `src/lib/prompts.js`, `src/lib/level.js`,
   `src/lib/stage.js` — pure, tested.
-- `src/lib/engine.js` — the two Claude calls (task generation, draft analysis).
-  Structured JSON output, `claude-opus-5` by default (`VITE_MODEL` overrides).
-- `src/lib/compat.js` — optional fallback provider, OpenAI-compatible shape.
-- `src/lib/store.js` + `src/composables/useStore.js` — one localStorage key,
-  reactive singleton, deep-watch auto-persist.
+- `src/lib/engine.js` — the two model calls (task generation, draft analysis). Builds
+  the prompts and schemas client-side, then invokes the `engine` Edge Function; holds
+  no key and names no provider.
+- `src/lib/jsonText.js` — recovers JSON from a chatty model response.
+- `src/lib/store.js` + `src/composables/useStore.js` — Supabase persistence,
+  localStorage as cache only.
 - Components are plain `<script setup>` + Tailwind utility classes. No design system,
   no component library — match the surrounding markup.
 
@@ -78,6 +88,13 @@ are verified in the browser.
 
 Static site on GitHub Pages + Supabase (auth, Postgres, one Edge Function). Model calls
 go through `supabase/functions/engine/`; prompt construction stays client-side.
+
+The function chains two interchangeable providers — `compat` (any OpenAI-compatible
+gateway) and `anthropic` (the Messages API) — in whatever order `ENGINE_ORDER` names,
+default `compat,anthropic`. Whichever leads is tried first and the other catches its
+failures; `fallback: true` in the response means "the leading one didn't answer" and is
+positional, not provider-specific. `COMPAT_*` secrets are also read under their original
+`FALLBACK_*` names, so the order can be flipped without re-setting any keys.
 
 ## Gotchas
 
@@ -96,13 +113,15 @@ go through `supabase/functions/engine/`; prompt construction stays client-side.
 - **Don't deep-watch state into the database.** The cache mirror is a deep watcher, but
   real writes are explicit per mutation; a deep watcher can't tell an insert from a load
   and would echo every fetch straight back to the server.
-- **The fallback has no schema enforcement.** Gateways don't proxy `output_config`, so
-  the JSON shape is prompted *as well as* schema'd and validated on return. Anything
-  reading engine output must tolerate malformed entries — `normalizeErrors` drops them
-  and filters codes through `CODE_SET`.
+- **The compat path has no schema enforcement.** Gateways don't proxy `output_config`,
+  so the JSON shape is prompted *as well as* schema'd and validated on return. Since
+  compat leads by default, that redundancy is the normal path, not the rare one:
+  anything reading engine output must tolerate malformed entries — `normalizeErrors`
+  and `normalizeGlossary` drop them, and codes are filtered through `CODE_SET`.
 - **A wrong pattern code is worse than a missing one.** It writes a false gap into the
   ledger, which then steers task generation, resurfacing, *and* the stage diagnosis.
-  Hence the strongest default model and the UI naming the model when the fallback grades.
+  Hence the feedback step always names the grading model — quietly when the leading
+  provider answered, in amber when it didn't.
 - **Generated tasks are cached for 24h** (`taskCache.js`) and cleared on completion or
   "Different task". Regenerating on every mount was burning real money on hot reloads.
   Stock fallback prompts are deliberately *not* cached, or a transient outage would

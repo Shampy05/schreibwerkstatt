@@ -43,7 +43,11 @@ async function invokeEngine({ system, user, maxTokens, schema }) {
   }
   if (data?.error) throw new Error(data.error)
   if (!data?.content) throw new Error('The engine returned no content.')
-  return { parsed: parseJsonText(data.content), via: data.via, fallback: Boolean(data.fallback) }
+  return {
+    parsed: parseJsonText(data.content),
+    via: data.via,
+    fallback: Boolean(data.fallback),
+  }
 }
 
 const ANALYSIS_SCHEMA = {
@@ -120,8 +124,8 @@ const ANALYSIS_JSON_SHAPE = `Respond with ONLY a JSON object — no prose, no ma
 "pattern_code" must be exactly one code from the taxonomy above. "clean" is true and "errors" empty when the text has no errors worth reporting.`
 
 const TASK_JSON_SHAPE = `Respond with ONLY a JSON object — no prose, no markdown fence:
-{"task": string, "requirements": [string], "obligates": [string]}
-"obligates" holds pattern codes from the taxonomy above. "requirements" holds 2–3 short English instructions.`
+{"task": string, "requirements": [string], "obligates": [string], "glossary": [{"de": string, "en": string}]}
+"obligates" holds pattern codes from the taxonomy above. "requirements" holds 2–3 short English instructions. "glossary" holds 0–6 German dictionary forms with short English glosses.`
 
 // Normalize an engine error into the app's camelCase shape, dropping
 // anything malformed rather than crashing the session.
@@ -201,8 +205,26 @@ const TASK_SCHEMA = {
       items: { type: 'string', enum: TAXONOMY.map((p) => p.code) },
       description: 'The pattern codes this task genuinely obligates.',
     },
+    glossary: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          de: {
+            type: 'string',
+            description:
+              'Dictionary form ONLY: noun with article and plural ("der Wasserhahn, -hähne"), verb as infinitive ("überlaufen"), adjective uninflected. Never a phrase, conjugated form, or clause.',
+          },
+          en: { type: 'string', description: 'English gloss, 1–3 words.' },
+        },
+        required: ['de', 'en'],
+        additionalProperties: false,
+      },
+      description:
+        '0–6 content words this specific situation forces the learner to use and that they plausibly do not know yet. Empty when the situation needs no special vocabulary.',
+    },
   },
-  required: ['task', 'requirements', 'obligates'],
+  required: ['task', 'requirements', 'obligates', 'glossary'],
   additionalProperties: false,
 }
 
@@ -219,12 +241,37 @@ Rules:
 - Be a little whimsical. A mild absurdity, a small domestic disaster, a gently ridiculous neighbour, an over-dramatic complaint about a cake. Warmth and humour make the writing worth doing; the situation should raise a small smile while still being a real communicative act. Never twee, never a joke instead of a task.
 - Rotate the domain hard. If the recent tasks were about food, go somewhere else entirely — travel, animals, family, weather, bureaucracy, a hobby, a misunderstanding between strangers.
 - Requirements are structural, not topical, and read as plain instructions ("give at least two reasons, each introduced with weil"). Naming a German trigger word is fine — that is what creates the context. NEVER write a German example clause or phrase showing the structure in use: the learner has to produce that themselves, and seeing it first destroys the exercise.
+- Give a short glossary of the content words this specific situation forces the learner to use and that they plausibly do not know yet — concrete nouns, specific verbs, the odd adjective. 3–6 entries, none at all when the situation genuinely needs no special vocabulary. This matters for the same reason the requirements do: a learner who cannot say "overflowed" writes a different, safer sentence instead, and the structure you were obligating vanishes with it. Vocabulary is not what is being tested here.
+- Glossary entries are DICTIONARY FORMS ONLY: nouns with article and plural ("der Wasserhahn, -hähne"), verbs as infinitives ("überlaufen"), adjectives uninflected ("undicht"). Never a phrase, never a conjugated or declined form, never a clause. The article is fine — a noun's gender is vocabulary; making it agree is the grammar being practised, and that stays the learner's job.
 - Respect the length stated above; a task that cannot be finished in that many sentences is too big.
 - A real communicative purpose, never a grammar drill in disguise. The learner should be able to forget the requirements exist and still hit them.
 - Vary sharply from the recent tasks listed: different situation, different register, different content domain.
 
 Taxonomy of patterns you may target:
 ${taxonomyPromptBlock()}`
+
+// A glossary entry is lexis, so it may not carry structure. Dictionary forms
+// are short; anything long enough to be a clause is the generator leaking the
+// answer into the vocabulary list, and gets dropped rather than shown.
+export function normalizeGlossary(raw) {
+  if (!Array.isArray(raw)) return []
+  const out = []
+  const seen = new Set()
+  for (const g of raw) {
+    if (!g || typeof g.de !== 'string' || typeof g.en !== 'string') continue
+    const de = g.de.trim()
+    const en = g.en.trim()
+    if (!de || !en) continue
+    if (/[.!?]/.test(de)) continue
+    if (de.split(/\s+/).length > 5) continue
+    const key = de.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ de, en })
+    if (out.length === 6) break
+  }
+  return out
+}
 
 function targetBlock(activeTargets) {
   if (!activeTargets.length) {
@@ -264,6 +311,7 @@ export async function generateTask({
       .map((r) => r.trim())
       .slice(0, 4),
     tags: (parsed.obligates || []).filter((c) => CODE_SET.has(c)),
+    glossary: normalizeGlossary(parsed.glossary),
     generated: true,
     via,
   }

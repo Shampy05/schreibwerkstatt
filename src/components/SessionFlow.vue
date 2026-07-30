@@ -228,6 +228,21 @@ const wordCount = computed(() => draft.value.trim().split(/\s+/).filter(Boolean)
           </ul>
         </div>
 
+        <details v-if="prompt.glossary?.length" class="mt-3">
+          <summary class="cursor-pointer text-xs font-semibold uppercase tracking-wide text-stone-400 hover:text-stone-600">
+            Words you might need ({{ prompt.glossary.length }})
+          </summary>
+          <dl class="mt-2 space-y-1">
+            <div v-for="(g, i) in prompt.glossary" :key="i" class="flex flex-wrap gap-x-2 text-sm">
+              <dt lang="de" class="font-medium text-stone-700">{{ g.de }}</dt>
+              <dd class="text-stone-500">— {{ g.en }}</dd>
+            </div>
+          </dl>
+          <p class="mt-1.5 text-xs text-stone-400">
+            Dictionary forms. The endings are yours to work out.
+          </p>
+        </details>
+
         <p class="mt-3 text-sm text-stone-500">
           Write it in German. Aim for {{ sentenceRange }} sentences, ~15 minutes.
           <span class="text-stone-400">· pitched at {{ level }}</span>
@@ -260,6 +275,17 @@ const wordCount = computed(() => draft.value.trim().split(/\s+/).filter(Boolean)
           <span class="text-stone-300">·</span><span>{{ r }}</span>
         </li>
       </ul>
+      <details v-if="prompt.glossary?.length" class="mt-2">
+        <summary class="cursor-pointer text-xs text-stone-400 hover:text-stone-600">
+          Words you might need ({{ prompt.glossary.length }})
+        </summary>
+        <dl class="mt-1.5 space-y-0.5">
+          <div v-for="(g, i) in prompt.glossary" :key="i" class="flex flex-wrap gap-x-2 text-sm">
+            <dt lang="de" class="font-medium text-stone-700">{{ g.de }}</dt>
+            <dd class="text-stone-500">— {{ g.en }}</dd>
+          </div>
+        </dl>
+      </details>
       <textarea
         v-model="draft"
         rows="10"
@@ -286,8 +312,11 @@ const wordCount = computed(() => draft.value.trim().split(/\s+/).filter(Boolean)
         v-if="gradedByFallback"
         class="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900"
       >
-        Graded by <strong>{{ analysisVia }}</strong> — the primary model was unreachable. Treat the
-        pattern codes with more suspicion than usual; they're going into your ledger.
+        Graded by <strong>{{ analysisVia }}</strong> — your first-choice model was unreachable. Treat
+        the pattern codes with more suspicion than usual; they're going into your ledger.
+      </p>
+      <p v-else-if="analysisVia" class="px-1 text-xs text-stone-400">
+        Graded by {{ analysisVia }}
       </p>
 
       <FeedbackPanel :errors="working" :text="rewrite" />

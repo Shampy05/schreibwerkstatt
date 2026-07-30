@@ -24,14 +24,30 @@ const json = (body: unknown, status = 200) =>
     headers: { ...CORS, 'Content-Type': 'application/json' },
   })
 
+// Two interchangeable providers, either of which may lead:
+//   compat    — any OpenAI-compatible gateway (OpenCode Zen/Go, DeepSeek, OpenRouter)
+//   anthropic — the Messages API
+// ENGINE_ORDER picks the chain; whichever is named first is tried first and the
+// other catches its failures. Default leads with compat. The COMPAT_* names are
+// the current ones; FALLBACK_* are the original names and still work, so
+// flipping the order needs no secrets to be re-set.
+const DEFAULT_ORDER = ['compat', 'anthropic']
+const CONFIGURED_ORDER = (Deno.env.get('ENGINE_ORDER') ?? '')
+  .split(',')
+  .map((p) => p.trim().toLowerCase())
+  .filter((p) => p === 'compat' || p === 'anthropic')
+// A typo'd ENGINE_ORDER means "no providers at all", which would look like a
+// missing key rather than a bad setting — fall back to the default instead.
+const ORDER = CONFIGURED_ORDER.length ? CONFIGURED_ORDER : DEFAULT_ORDER
+
 const MODEL = Deno.env.get('MODEL') ?? 'claude-opus-5'
 const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY') ?? ''
-const FALLBACK_MODEL = Deno.env.get('FALLBACK_MODEL') ?? ''
-const FALLBACK_API_KEY = Deno.env.get('FALLBACK_API_KEY') ?? ''
-const FALLBACK_BASE_URL = Deno.env.get('FALLBACK_BASE_URL') ?? ''
+const COMPAT_MODEL = Deno.env.get('COMPAT_MODEL') ?? Deno.env.get('FALLBACK_MODEL') ?? ''
+const COMPAT_API_KEY = Deno.env.get('COMPAT_API_KEY') ?? Deno.env.get('FALLBACK_API_KEY') ?? ''
+const COMPAT_BASE_URL = Deno.env.get('COMPAT_BASE_URL') ?? Deno.env.get('FALLBACK_BASE_URL') ?? ''
 
-const hasPrimary = Boolean(ANTHROPIC_API_KEY)
-const hasFallback = Boolean(FALLBACK_MODEL && FALLBACK_API_KEY && FALLBACK_BASE_URL)
+const hasAnthropic = Boolean(ANTHROPIC_API_KEY)
+const hasCompat = Boolean(COMPAT_MODEL && COMPAT_API_KEY && COMPAT_BASE_URL)
 
 async function callAnthropic(system: string, user: string, maxTokens: number, schema: unknown) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -58,21 +74,21 @@ async function callAnthropic(system: string, user: string, maxTokens: number, sc
   }
   const block = (data.content ?? []).find((b: { type: string }) => b.type === 'text')
   if (!block?.text) throw new Error('Empty analysis response.')
-  return { content: block.text as string, via: MODEL, fallback: false }
+  return { content: block.text as string, via: MODEL, schemaEnforced: true }
 }
 
 // OpenAI-compatible shape: OpenCode Zen/Go, DeepSeek, OpenRouter, Ollama.
 // No schema enforcement here — the caller's prompt spells the JSON shape out
 // and the client validates on the way back in.
-async function callFallback(system: string, user: string, maxTokens: number) {
-  const res = await fetch(`${FALLBACK_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
+async function callCompat(system: string, user: string, maxTokens: number) {
+  const res = await fetch(`${COMPAT_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      authorization: `Bearer ${FALLBACK_API_KEY}`,
+      authorization: `Bearer ${COMPAT_API_KEY}`,
     },
     body: JSON.stringify({
-      model: FALLBACK_MODEL,
+      model: COMPAT_MODEL,
       max_tokens: maxTokens,
       response_format: { type: 'json_object' },
       messages: [
@@ -82,12 +98,12 @@ async function callFallback(system: string, user: string, maxTokens: number) {
     }),
   })
   if (!res.ok) {
-    throw new Error(`${FALLBACK_MODEL} ${res.status}: ${(await res.text()).slice(0, 300)}`)
+    throw new Error(`${COMPAT_MODEL} ${res.status}: ${(await res.text()).slice(0, 300)}`)
   }
   const data = await res.json()
   const content = data?.choices?.[0]?.message?.content
-  if (!content) throw new Error(`${FALLBACK_MODEL} returned no content.`)
-  return { content: content as string, via: FALLBACK_MODEL, fallback: true }
+  if (!content) throw new Error(`${COMPAT_MODEL} returned no content.`)
+  return { content: content as string, via: COMPAT_MODEL, schemaEnforced: false }
 }
 
 Deno.serve(async (req) => {
@@ -131,28 +147,23 @@ Deno.serve(async (req) => {
   const maxTokens = Number.isInteger(body.maxTokens) ? Math.min(body.maxTokens!, 8192) : 4096
   if (!system || !userMsg) return json({ error: 'system and user are required.' }, 400)
 
-  // --- primary, then fallback ---------------------------------------------
-  if (hasPrimary) {
+  // --- run the chain in ENGINE_ORDER --------------------------------------
+  // `fallback` is positional, not provider-specific: it means "the one we
+  // wanted didn't answer", which is what the UI warns about.
+  const chain = ORDER.filter((p) => (p === 'anthropic' ? hasAnthropic : hasCompat))
+  if (!chain.length) return json({ error: 'No model configured on the server.' }, 500)
+
+  const failures: string[] = []
+  for (const [i, provider] of chain.entries()) {
     try {
-      return json(await callAnthropic(system, userMsg, maxTokens, body.schema))
+      const result =
+        provider === 'anthropic'
+          ? await callAnthropic(system, userMsg, maxTokens, body.schema)
+          : await callCompat(system, userMsg, maxTokens)
+      return json({ ...result, fallback: i > 0 })
     } catch (e) {
-      if (!hasFallback) return json({ error: (e as Error).message }, 502)
-      try {
-        return json(await callFallback(system, userMsg, maxTokens))
-      } catch (f) {
-        return json(
-          { error: `${MODEL}: ${(e as Error).message} — ${FALLBACK_MODEL}: ${(f as Error).message}` },
-          502
-        )
-      }
+      failures.push((e as Error).message)
     }
   }
-  if (hasFallback) {
-    try {
-      return json(await callFallback(system, userMsg, maxTokens))
-    } catch (f) {
-      return json({ error: (f as Error).message }, 502)
-    }
-  }
-  return json({ error: 'No model configured on the server.' }, 500)
+  return json({ error: failures.join(' — ') }, 502)
 })

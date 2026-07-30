@@ -24,8 +24,8 @@ Then, once per project:
 ```bash
 npx supabase link --project-ref tpsgpghpqgzmgjlshdzj
 npx supabase db push
-npx supabase secrets set ANTHROPIC_API_KEY=… ALLOWED_EMAILS=you@example.com
-npx supabase functions deploy engine
+npx supabase secrets set ALLOWED_EMAILS=you@example.com COMPAT_MODEL=… COMPAT_API_KEY=… COMPAT_BASE_URL=…
+npx supabase functions deploy engine --use-api
 ```
 
 `ALLOWED_EMAILS` is not optional in spirit: Supabase Auth permits public signup, so
@@ -41,7 +41,11 @@ signups in the Supabase dashboard.
    you write six safe SVO sentences, so the ledger fills with spelling errors while
    the real gaps stay invisible. The generator may name a German trigger word
    (`weil`) but never shows the structure in use — that's the part you produce.
-   `prompts.js` holds a static bank used as the offline/failure fallback.
+   It also ships a short glossary of the content words that situation forces, collapsed
+   behind a toggle. Missing vocabulary causes avoidance just as reliably as missing
+   structure, and vocabulary is Garten's job, not this app's — so you get `der
+   Wasserhahn, -hähne`, and you still have to decline it yourself. `prompts.js` holds a
+   static bank used as the offline/failure fallback.
 2. **Draft** — no live correction (retrieval effort is the point). Mark uncertain forms with a
    trailing `?` — the analysis addresses those first (Swain's hypothesis-testing).
 3. **Feedback ladder** — one card per error; help escalates only when you ask:
@@ -62,9 +66,9 @@ selection (focused-WCF).
 - `src/lib/ladder.js` — graduated-feedback rungs (pure, tested)
 - `src/lib/ledger.js` — pattern ledger operations (pure, tested)
 - `src/lib/prompts.js` — fallback prompt bank tagged with obligated patterns (tested)
-- `src/lib/engine.js` — the two Claude calls (task generation, draft analysis):
-  structured JSON output, server-side refusal fallback enabled. Model defaults to
-  `claude-opus-5`, overridable with `VITE_MODEL`
+- `src/lib/engine.js` — the two model calls (task generation, draft analysis): prompts
+  and JSON schemas built client-side, then handed to the proxy. Names no provider and
+  holds no key
 - `src/lib/level.js` / `src/lib/stage.js` — CEFR ceiling and Processability floor
 - `src/lib/jsonText.js` — recovers JSON from a chatty model response
 - `src/composables/useStore.js` — Supabase persistence, localStorage as cache only
@@ -73,15 +77,21 @@ selection (focused-WCF).
 ### The engine proxy
 
 Prompt construction stays on the client (it's pedagogy, not a secret); the call goes
-through the `engine` Edge Function, which holds `ANTHROPIC_API_KEY` and the optional
-fallback credentials and keeps the Anthropic → OpenAI-compatible fallback chain
-server-side. Two auth layers: `verify_jwt` rejects unsigned requests, but since the
-anon key is itself a valid project JWT, the function additionally requires a real user
-*and* an allowlisted email.
+through the `engine` Edge Function, which holds every model credential and keeps the
+provider chain server-side. Two auth layers: `verify_jwt` rejects unsigned requests, but
+since the anon key is itself a valid project JWT, the function additionally requires a
+real user *and* an allowlisted email.
 
-Sessions record which model graded them (`gradedBy`), and the feedback step warns when
-the fallback answered — a weaker model writing pattern codes into the ledger is worth
-knowing about, since those codes steer future task generation and stage diagnosis.
+Two interchangeable providers, ordered by `ENGINE_ORDER` (default `compat,anthropic`):
+`compat` is any OpenAI-compatible gateway — OpenCode Zen/Go, DeepSeek, OpenRouter — and
+`anthropic` is the Messages API. Whichever is named first leads; the other catches its
+failures. Only the Anthropic path can enforce the JSON schema, so on the compat path the
+shape is prompted as well as validated client-side.
+
+Sessions record which model graded them (`gradedBy`), and the feedback step always names
+it — quietly when your first choice answered, in amber when it didn't. Which model wrote
+your pattern codes is worth knowing: those codes steer future task generation and the
+stage diagnosis.
 
 ### Data
 
