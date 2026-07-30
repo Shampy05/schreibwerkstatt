@@ -1,0 +1,6 @@
+project_id = "tpsgpghpqgzmgjlshdzj"
+
+[functions.engine]
+# First auth layer. Note this alone accepts ANY valid project JWT, including the
+# anon key — index.ts additionally requires a real user and an allowlisted email.
+verify_jwt = true
