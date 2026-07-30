@@ -51,9 +51,15 @@ signups in the Supabase dashboard.
 3. **Feedback ladder** — one card per error; help escalates only when you ask:
    L1 locate → L2 underline → L3 pattern code → L4 rule explanation → L5 correction.
    The engine returns the full analysis in one call; the ladder is client-side progressive
-   disclosure, so the correction exists but is never shown first.
+   disclosure, so the correction exists but is never shown first. Every card can be
+   rejected ("Not an error"), and a whole session can be deleted from the Verlauf tab —
+   the engine is fallible, and a wrong pattern code steers your future tasks, your target
+   admissibility, and your stage diagnosis.
 4. **Rewrite until clean** — feedback without required revision does ≈ nothing (Truscott's
-   valid point), so the session ends with a verified clean text.
+   valid point), so the session ends with a verified clean text. Any `?` hypothesis marks
+   still in it are listed before you finish, each removable with a click — they're the
+   scaffolding you thought with, not part of the finished text. Nothing is stripped
+   automatically: a real German question mark is indistinguishable by rule.
 5. **Languaging note** — one sentence per pattern, in your own words; stored on the pattern.
 
 The **Ledger** tab is the data spine: per-pattern occurrence counts, help-level trajectories
@@ -94,6 +100,11 @@ your pattern codes is worth knowing: those codes steer future task generation an
 stage diagnosis.
 
 ### Data
+
+An unfinished session is autosaved to localStorage only — reload or close the tab
+mid-draft and you get it back. It becomes a row when the session completes; if that write
+fails it is kept locally, flagged, surfaced, and retried on the next load rather than
+being silently dropped.
 
 `sessions` and `user_settings` in Postgres, RLS-scoped to your user. The error ledger
 is **not** a table: it's a pure fold over `sessions` (`buildLedger`), so it can never

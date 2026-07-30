@@ -1,17 +1,22 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { pickPrompt } from '../lib/prompts'
 import { analyzeDraft, generateTask, hasEngine } from '../lib/engine'
 
 import { normalizeLevel, levelDescriptor } from '../lib/level'
 import { isTaskFresh } from '../lib/taskCache'
 import { sessionPatternCodes } from '../lib/ledger'
+import { matchError, isSameAsAny, resolveWorking } from '../lib/errorMatch'
+import { loadDraft, saveDraft, clearDraft } from '../lib/store'
+import { findHypothesisMarks, removeMarkAt, removeAllMarks } from '../lib/hypothesisMarks'
 import { patternFor } from '../lib/taxonomy'
 import { rungTrajectory } from '../lib/ladder'
 import { useStore } from '../composables/useStore'
+import { useAuth } from '../composables/useAuth'
 import FeedbackPanel from './FeedbackPanel.vue'
 
 const { state, completeSession, setCurrentTask, ceiling, todayStr } = useStore()
+const { userId } = useAuth()
 const level = computed(() => normalizeLevel(state.settings.cefrLevel))
 const sentenceRange = computed(() => levelDescriptor(level.value).sentences)
 
@@ -31,6 +36,13 @@ const checkCount = ref(0)
 // the weaker fallback writes less trustworthy patterns into the ledger.
 const analysisVia = ref('')
 const gradedByFallback = ref(false)
+// The text the errors were located against. Frozen at analysis time: rung 1 is
+// nothing but a sentence number, and pointing it at the live rewrite made that
+// number drift — and therefore lie — the moment a sentence was added or cut.
+const analyzedText = ref('')
+// Errors the learner has rejected, as { quote, patternCode }. Kept for the rest
+// of the session so re-checking a rewrite doesn't resurrect them.
+const dismissed = ref([])
 
 // Working list: unresolved errors in the current rewrite, each { id, quote,
 // sentenceIndex, patternCode, explanation, correction, revealedRung }.
@@ -43,9 +55,12 @@ const notes = ref({})
 let nextId = 1
 function toWorking(errors, prior = []) {
   return errors.map((e) => {
-    // An identical span+pattern seen before keeps its revealed rung — the
-    // learner shouldn't have to re-climb for the same unfixed error.
-    const match = prior.find((p) => p.quote === e.quote && p.patternCode === e.patternCode)
+    // The same error seen before keeps its revealed rung — the learner
+    // shouldn't have to re-climb for something they haven't fixed yet. Matched
+    // on code + overlapping span, not an identical quote: a re-quote with
+    // different boundaries is the same error, and treating it as a new one
+    // threw away the rung history.
+    const match = matchError(e, prior)
     return { ...e, id: nextId++, revealedRung: match ? match.revealedRung : 1 }
   })
 }
@@ -65,8 +80,13 @@ async function loadTask({ force = false } = {}) {
   fromCache.value = false
 
   // Reuse the stored task unless it's stale or the learner asked for another.
+  // "Stale" includes a level or target change since it was generated — keeping
+  // it would silently ignore the setting the learner just changed.
   const cached = state.settings.currentTask
-  if (!force && isTaskFresh(cached)) {
+  if (
+    !force &&
+    isTaskFresh(cached, { level: level.value, targets: state.settings.activeTargets })
+  ) {
     prompt.value = cached
     fromCache.value = true
     return
@@ -103,23 +123,101 @@ function newTask() {
   loadTask({ force: true })
 }
 
-onMounted(() => loadTask())
+// --- in-progress session autosave -------------------------------------------
+//
+// A draft used to live only in these refs, so closing the tab twelve minutes
+// into a fifteen-minute session threw the text away. Local only — an unfinished
+// session is scratch work and has no business on the server.
+
+function snapshot() {
+  return {
+    step: step.value,
+    prompt: prompt.value,
+    draft: draft.value,
+    rewrite: rewrite.value,
+    praise: praise.value,
+    checkCount: checkCount.value,
+    analysisVia: analysisVia.value,
+    gradedByFallback: gradedByFallback.value,
+    analyzedText: analyzedText.value,
+    working: working.value,
+    recorded: recorded.value,
+    notes: notes.value,
+    dismissed: dismissed.value,
+    nextId,
+  }
+}
+
+function restore(snap) {
+  step.value = snap.step || 'draft'
+  prompt.value = snap.prompt || null
+  draft.value = snap.draft || ''
+  rewrite.value = snap.rewrite || ''
+  praise.value = snap.praise || ''
+  checkCount.value = snap.checkCount || 0
+  analysisVia.value = snap.analysisVia || ''
+  gradedByFallback.value = Boolean(snap.gradedByFallback)
+  analyzedText.value = snap.analyzedText || ''
+  working.value = snap.working || []
+  recorded.value = snap.recorded || []
+  notes.value = snap.notes || {}
+  dismissed.value = snap.dismissed || []
+  // Ids must not collide with the restored cards' ids.
+  nextId = Math.max(snap.nextId || 1, ...working.value.map((w) => w.id + 1), 1)
+}
+
+let saveTimer = null
+function scheduleSave() {
+  if (saveTimer) clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => {
+    if (step.value === 'prompt' || step.value === 'done') return
+    saveDraft(userId.value, snapshot())
+  }, 400)
+}
+
+function discardDraft() {
+  if (saveTimer) clearTimeout(saveTimer)
+  clearDraft(userId.value)
+}
+
+watch(
+  [step, draft, rewrite, working, recorded, notes, dismissed],
+  () => scheduleSave(),
+  { deep: true }
+)
+
+onMounted(() => {
+  const saved = loadDraft(userId.value)
+  if (saved && saved.prompt) {
+    restore(saved)
+    return
+  }
+  loadTask()
+})
+
+// An error the learner has already rejected must not come back on the next
+// check — the whole point of rejecting it was to keep it out of the ledger.
+function keepable(errors) {
+  return errors.filter((e) => !isSameAsAny(e, dismissed.value))
+}
 
 async function getFeedback() {
   errorMsg.value = ''
   busy.value = true
+  const text = draft.value.trim()
   try {
-    const analysis = await analyzeDraft(draft.value.trim(), { level: level.value })
+    const analysis = await analyzeDraft(text, { level: level.value })
     analysisVia.value = analysis.via
     gradedByFallback.value = analysis.fallback
     praise.value = analysis.praise
-    if (analysis.clean) {
+    analyzedText.value = text
+    rewrite.value = text
+    const errors = keepable(analysis.errors)
+    if (analysis.clean || !errors.length) {
       working.value = []
-      rewrite.value = draft.value.trim()
       step.value = 'languaging'
     } else {
-      working.value = toWorking(analysis.errors)
-      rewrite.value = draft.value.trim()
+      working.value = toWorking(errors)
       checkCount.value = 0
       step.value = 'feedback'
     }
@@ -133,23 +231,18 @@ async function getFeedback() {
 async function checkRewrite() {
   errorMsg.value = ''
   busy.value = true
+  const text = rewrite.value.trim()
   try {
-    const analysis = await analyzeDraft(rewrite.value.trim(), { level: level.value })
+    const analysis = await analyzeDraft(text, { level: level.value })
     analysisVia.value = analysis.via
     gradedByFallback.value = analysis.fallback
+    analyzedText.value = text
     checkCount.value++
+    const still = keepable(analysis.errors)
     // Old errors not re-flagged in the rewrite are resolved at their
     // current rung — that's the dynamic-assessment measure we keep.
-    const still = analysis.errors
-    for (const old of working.value) {
-      const reFlagged = still.some(
-        (n) => n.patternCode === old.patternCode && n.quote === old.quote
-      )
-      if (!reFlagged) {
-        recorded.value.push({ quote: old.quote, patternCode: old.patternCode, rung: old.revealedRung })
-      }
-    }
-    if (analysis.clean) {
+    recorded.value = [...recorded.value, ...resolveWorking(working.value, still)]
+    if (analysis.clean || !still.length) {
       working.value = []
       step.value = 'languaging'
     } else {
@@ -163,6 +256,14 @@ async function checkRewrite() {
   }
 }
 
+// Rejecting an engine error drops it without recording an occurrence: it never
+// happened as far as the ledger is concerned. That matters because a wrong
+// pattern code steers task generation and the stage diagnosis.
+function dismissError(err) {
+  dismissed.value = [...dismissed.value, { quote: err.quote, patternCode: err.patternCode }]
+  working.value = working.value.filter((w) => w.id !== err.id)
+}
+
 function finishAnyway() {
   for (const old of working.value) {
     recorded.value.push({ quote: old.quote, patternCode: old.patternCode, rung: old.revealedRung, unresolved: true })
@@ -172,6 +273,19 @@ function finishAnyway() {
 }
 
 const sessionCodes = computed(() => sessionPatternCodes(recorded.value))
+
+// The final text shouldn't carry the scaffolding you wrote to think with. Not
+// auto-stripped: a real question mark is indistinguishable by rule, so each one
+// is offered individually and you decide.
+const marks = computed(() => findHypothesisMarks(rewrite.value))
+
+function clearMark(index) {
+  rewrite.value = removeMarkAt(rewrite.value, index)
+}
+
+function clearAllMarks() {
+  rewrite.value = removeAllMarks(rewrite.value)
+}
 
 function finishSession() {
   completeSession({
@@ -187,10 +301,12 @@ function finishSession() {
     errors: recorded.value,
     notes: notes.value,
   })
+  discardDraft()
   step.value = 'done'
 }
 
 function newSession() {
+  discardDraft()
   step.value = 'prompt'
   draft.value = ''
   rewrite.value = ''
@@ -198,10 +314,12 @@ function newSession() {
   working.value = []
   recorded.value = []
   notes.value = {}
+  dismissed.value = []
   checkCount.value = 0
   errorMsg.value = ''
   analysisVia.value = ''
   gradedByFallback.value = false
+  analyzedText.value = ''
   loadTask()
 }
 
@@ -293,8 +411,11 @@ const wordCount = computed(() => draft.value.trim().split(/\s+/).filter(Boolean)
         class="mt-3 w-full rounded-lg border border-stone-300 p-3 font-serif text-base leading-relaxed focus:border-emerald-600 focus:outline-none"
         placeholder="Schreib hier auf Deutsch… (mark a form you're unsure about with a trailing ?, e.g. „dem? Mann“ — the feedback pass addresses those first)"
       ></textarea>
-      <div class="mt-3 flex items-center justify-between">
-        <span class="text-xs text-stone-400">{{ wordCount }} words · no live correction, on purpose</span>
+      <div class="mt-3 flex items-center justify-between gap-3">
+        <span class="text-xs text-stone-400">
+          {{ wordCount }} words · no live correction, on purpose ·
+          <button class="underline hover:text-stone-600" @click="newSession">start over</button>
+        </span>
         <button
           class="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800 disabled:opacity-50"
           :disabled="busy || wordCount < 10"
@@ -319,7 +440,12 @@ const wordCount = computed(() => draft.value.trim().split(/\s+/).filter(Boolean)
         Graded by {{ analysisVia }}
       </p>
 
-      <FeedbackPanel :errors="working" :text="rewrite" />
+      <FeedbackPanel :errors="working" :text="analyzedText" @dismiss="dismissError" />
+
+      <p v-if="!working.length" class="rounded-lg bg-stone-100 px-3 py-2 text-xs text-stone-500">
+        Every card dismissed. Check the rewrite to confirm the text is clean — the dismissed ones
+        won't come back.
+      </p>
 
       <div class="rounded-xl border border-stone-200 bg-white p-6 shadow-sm">
         <p class="text-xs font-semibold uppercase tracking-wide text-stone-400">Your rewrite</p>
@@ -354,6 +480,33 @@ const wordCount = computed(() => draft.value.trim().split(/\s+/).filter(Boolean)
         {{ sessionCodes.length ? 'One sentence per pattern' : 'Clean text!' }}
       </p>
       <p v-if="praise" class="mt-2 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800">{{ praise }}</p>
+
+      <div v-if="marks.length" class="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2">
+        <p class="text-xs text-amber-900">
+          Your text still has {{ marks.length }} “?”. Remove any that were hypothesis marks —
+          the session is meant to end in a clean text. Real questions can stay.
+        </p>
+        <ul class="mt-2 space-y-1">
+          <li v-for="m in marks" :key="m.index" class="flex items-center gap-2 text-sm">
+            <span lang="de" class="truncate font-serif text-stone-700">
+              …{{ m.before }}<span class="text-amber-700">{{ m.after }}</span>…
+            </span>
+            <button
+              class="ml-auto shrink-0 rounded border border-amber-300 px-2 py-0.5 text-xs text-amber-900 hover:bg-amber-100"
+              @click="clearMark(m.index)"
+            >
+              remove
+            </button>
+          </li>
+        </ul>
+        <button
+          v-if="marks.length > 1"
+          class="mt-2 text-xs text-amber-900 underline hover:text-amber-700"
+          @click="clearAllMarks"
+        >
+          None of these are real questions — remove all
+        </button>
+      </div>
 
       <template v-if="sessionCodes.length">
         <p class="mt-2 text-sm text-stone-500">

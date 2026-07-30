@@ -76,6 +76,7 @@ targets partly to narrow that gap.
   the prompts and schemas client-side, then invokes the `engine` Edge Function; holds
   no key and names no provider.
 - `src/lib/jsonText.js` — recovers JSON from a chatty model response.
+- `src/lib/errorMatch.js` — error identity and rewrite resolution (pure, tested).
 - `src/lib/store.js` + `src/composables/useStore.js` — Supabase persistence,
   localStorage as cache only.
 - Components are plain `<script setup>` + Tailwind utility classes. No design system,
@@ -110,6 +111,37 @@ positional, not provider-specific. `COMPAT_*` secrets are also read under their 
 - **The ledger is derived, not stored.** `buildLedger(sessions)` folds it from sessions,
   oldest-first so rung trajectories read correctly. Don't add a ledger table — that
   creates two sources of truth that drift.
+- **Never match engine errors on an exact quote.** Use `sameError` / `matchError` /
+  `resolveWorking` (`src/lib/errorMatch.js`): same pattern code + overlapping normalized
+  span. Exact-string matching meant a model that re-quoted an unfixed error with
+  different boundaries ("weil es ist" → "es ist") recorded a *resolution* — inventing
+  internalization that never happened — while the same error re-entered the working list
+  at rung 1, discarding the rungs already climbed. That fold is the app's only progress
+  metric; treat a false positive there as a data-corruption bug.
+- **A failed write must be visible and must not lose work.** `completeSession` flags a
+  failed insert `pending` instead of dropping it, `mergeSessions` protects it from being
+  clobbered by the next load, and `retryPending` re-sends it. `loadError` / `syncError`
+  are rendered in `App.vue` — they previously existed but were displayed nowhere, so a
+  failed save was indistinguishable from a successful one and the next load silently ate
+  the session.
+- **Anything the engine asserts must be refusable.** The learner can dismiss an error
+  card ("Not an error") and delete a whole session. Both exist because a hallucinated
+  pattern code is not cosmetic: it steers task generation, target admissibility, and the
+  stage diagnosis. Dismissals are session-scoped and filtered from every later analysis.
+- **Never auto-strip a hypothesis mark.** `?` marks a form the learner is unsure of, and
+  the engine is told it isn't an error — so a text can pass clean with the scaffolding
+  still in it and be stored as the final text. It cannot be removed by rule, though: in
+  German every noun is capitalised, so „dem? Mann“ and „…dir? Mein Hund“ are structurally
+  identical and any heuristic either eats real punctuation or misses the common case.
+  `hypothesisMarks.js` finds them, the languaging step shows each in context, the learner
+  removes them one at a time.
+- **Only bank ids go in `recentPromptIds`.** It exists solely to stop `pickPrompt`
+  repeating itself; a generated task's `gen-<uuid>` means nothing to the bank, and letting
+  those in filled all six slots so nothing was ever excluded. `isBankPrompt` gates the
+  whole list on write, which also flushes ids stored before the fix.
+- **In-progress sessions are local and never hit the server.** `saveDraft` / `loadDraft`
+  / `clearDraft` in `store.js`, under their own key. An unfinished draft is scratch work;
+  it becomes a row only when the session completes.
 - **Don't deep-watch state into the database.** The cache mirror is a deep watcher, but
   real writes are explicit per mutation; a deep watcher can't tell an insert from a load
   and would echo every fetch straight back to the server.
@@ -125,7 +157,9 @@ positional, not provider-specific. `COMPAT_*` secrets are also read under their 
 - **Generated tasks are cached for 24h** (`taskCache.js`) and cleared on completion or
   "Different task". Regenerating on every mount was burning real money on hot reloads.
   Stock fallback prompts are deliberately *not* cached, or a transient outage would
-  suppress retries for a day.
+  suppress retries for a day. A cached task also carries a `fingerprint` of the level and
+  targets it was generated under — without it, changing either appeared to do nothing at
+  all for up to a day.
 
 ## Deliberately not built
 

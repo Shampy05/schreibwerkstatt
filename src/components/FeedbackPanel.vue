@@ -13,6 +13,11 @@ const props = defineProps({
   text: { type: String, required: true },
 })
 
+// Disputing an error is not a convenience — the engine can invent one, and an
+// invented pattern code writes a false gap into the ledger, which then steers
+// task generation and the stage diagnosis. Dismissing keeps it out entirely.
+const emit = defineEmits(['dismiss'])
+
 const sentences = computed(() => splitSentences(props.text))
 
 function sentenceLabel(err) {
@@ -67,15 +72,24 @@ function reveal(err) {
           <span class="rounded bg-emerald-100 px-1 font-medium text-emerald-900">{{ err.correction }}</span>
         </p>
 
-        <div class="mt-3 flex items-center justify-between">
+        <div class="mt-3 flex items-center justify-between gap-3">
           <span class="text-xs text-stone-400">help level {{ err.revealedRung }}/{{ MAX_RUNG }}</span>
-          <button
-            v-if="err.revealedRung < MAX_RUNG"
-            class="rounded border border-stone-300 px-2.5 py-1 text-xs text-stone-600 hover:bg-stone-100"
-            @click="reveal(err)"
-          >
-            {{ rungLabel(err.revealedRung + 1) }}
-          </button>
+          <div class="flex items-center gap-2">
+            <button
+              class="text-xs text-stone-400 underline hover:text-stone-600"
+              title="Drop this card and keep it out of your ledger — use it when the engine is wrong."
+              @click="emit('dismiss', err)"
+            >
+              Not an error
+            </button>
+            <button
+              v-if="err.revealedRung < MAX_RUNG"
+              class="rounded border border-stone-300 px-2.5 py-1 text-xs text-stone-600 hover:bg-stone-100"
+              @click="reveal(err)"
+            >
+              {{ rungLabel(err.revealedRung + 1) }}
+            </button>
+          </div>
         </div>
       </div>
     </div>

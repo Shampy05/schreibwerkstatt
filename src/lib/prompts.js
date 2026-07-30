@@ -32,6 +32,16 @@ export const PROMPTS = [
   { id: 'cake',        text: 'Describe, with more drama than the situation deserves, a cake that went badly wrong.', tags: ['V-TEMP', 'ADJ-END', 'WO-KLAM'] },
 ]
 
+// Only these ids mean anything to `exclude` below. Generated tasks carry a
+// `gen-<uuid>` id, and letting those into the recent list filled all six slots
+// with ids the bank has never heard of — so no bank prompt was ever excluded
+// and the offline fallback repeated itself freely.
+export const BANK_IDS = new Set(PROMPTS.map((p) => p.id))
+
+export function isBankPrompt(id) {
+  return BANK_IDS.has(id)
+}
+
 // Pick a prompt, preferring ones that obligate at least one active target
 // (the bias is silent — the writer just sees a communicative task). The
 // `exclude` list keeps recently used prompts out of rotation.

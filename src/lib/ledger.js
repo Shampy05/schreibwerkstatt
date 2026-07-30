@@ -64,7 +64,14 @@ export function suggestTargets(
       return { code: entry.code, recentCount: recent.length, lastSeen }
     })
     .filter((s) => s.recentCount > 0 && (!allow || allow.has(s.code)))
-  scored.sort((a, b) => b.recentCount - a.recentCount || (b.lastSeen < a.lastSeen ? -1 : 1))
+  // Most frequent first, then most recent. The tiebreak must return 0 on equal
+  // dates — returning 1 for both (a,b) and (b,a) is an inconsistent comparator
+  // and left tied patterns in implementation-defined order.
+  scored.sort(
+    (a, b) =>
+      b.recentCount - a.recentCount ||
+      (a.lastSeen === b.lastSeen ? 0 : a.lastSeen < b.lastSeen ? 1 : -1)
+  )
   return scored.slice(0, max).map((s) => s.code)
 }
 

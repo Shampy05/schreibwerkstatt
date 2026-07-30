@@ -64,6 +64,30 @@ describe('ledger', () => {
     expect(suggestTargets(l, { now })).toContain('WO-VF')
   })
 
+  it('suggestTargets breaks frequency ties by recency, deterministically', () => {
+    const now = new Date('2026-07-29')
+    let l = {}
+    // Equal counts, different last-seen dates: most recent must lead.
+    for (const [code, date] of [
+      ['WO-VF', '2026-07-20'],
+      ['ADJ-END', '2026-07-27'],
+      ['KAS-DAT', '2026-07-24'],
+    ]) {
+      for (let i = 0; i < 2; i++) l = recordOccurrence(l, code, occ(date))
+    }
+    expect(suggestTargets(l, { now })).toEqual(['ADJ-END', 'KAS-DAT', 'WO-VF'])
+  })
+
+  it('suggestTargets is stable when count and date are both tied', () => {
+    const now = new Date('2026-07-29')
+    let l = {}
+    for (const code of ['WO-VF', 'ADJ-END']) l = recordOccurrence(l, code, occ('2026-07-25'))
+    // The old comparator returned 1 for both (a,b) and (b,a) here, leaving the
+    // order up to the engine's sort implementation.
+    const first = suggestTargets(l, { now })
+    for (let i = 0; i < 20; i++) expect(suggestTargets(l, { now })).toEqual(first)
+  })
+
   it('sessionPatternCodes dedupes in first-seen order', () => {
     const errors = [
       { patternCode: 'WO-VF' },
