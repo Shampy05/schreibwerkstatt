@@ -82,6 +82,14 @@ describe('resolveWorking', () => {
     ])
   })
 
+  it('carries the correction through for the review, and omits it when absent', () => {
+    const withCorrection = [{ ...err('weil es ist'), revealedRung: 2, correction: 'weil es gut ist' }]
+    expect(resolveWorking(withCorrection, [])).toEqual([
+      { quote: 'weil es ist', patternCode: 'WO-VF', rung: 2, correction: 'weil es gut ist' },
+    ])
+    expect(resolveWorking([{ ...err('x'), revealedRung: 1 }], [])[0]).not.toHaveProperty('correction')
+  })
+
   it('resolves everything when the rewrite comes back clean', () => {
     expect(resolveWorking(working, [])).toHaveLength(2)
   })

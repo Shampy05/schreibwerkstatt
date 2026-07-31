@@ -60,7 +60,16 @@ signups in the Supabase dashboard.
    still in it are listed before you finish, each removable with a click — they're the
    scaffolding you thought with, not part of the finished text. Nothing is stripped
    automatically: a real German question mark is indistinguishable by rule.
-5. **Languaging note** — one sentence per pattern, in your own words; stored on the pattern.
+5. **Session review** — a recap before the reflection, not a form. Praise for your *first*
+   draft (the only text you produced unaided), then every error you closed, as
+   „quote“ → correction with the help level it cost. Underneath, a languaging note is
+   asked for on the one or two patterns that earned it — ranked by the rung you needed,
+   with a bump for repeats and active targets — each shown with your own quote, the
+   pattern's history, and the note you last wrote about it, to sharpen rather than
+   restate. The rest are logged silently: a wall of empty boxes gets none of them
+   filled, which is the same focused-WCF reasoning that caps active targets at three.
+   Finishing offers to promote a recurring pattern to an active target, since that is
+   the moment its evidence is freshest.
 
 The **Ledger** tab is the data spine: per-pattern occurrence counts, help-level trajectories
 (L4 → L2 → L1 = internalization), your notes, and the ≤3 active targets that bias prompt

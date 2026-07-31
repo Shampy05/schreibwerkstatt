@@ -20,6 +20,19 @@ the pedagogy below is not preference, it is the reason the app exists.
   does, rung 4 has silently become rung 5 and the retrieval effort is gone.
 - **Revision is mandatory.** A session ends with a verified clean text. Feedback
   without required revision does approximately nothing.
+- **Praise belongs to the first draft only.** `draftPraise` is captured once, in
+  `getFeedback`, and never overwritten by a later check. Re-analysing the corrected text
+  and praising *that* congratulates the learner for corrections the engine handed them;
+  the unaided draft is the only text they actually produced.
+- **Languaging is focused, and it needs the learner's own error in front of it.** The
+  review step (`src/lib/review.js`) ranks the session's patterns by the rung needed, with
+  a bump for repeats, active targets, and errors left unfixed, and asks for a note on the
+  top `MAX_NOTE_ASKS` only — everything else is logged silently and can be annotated on
+  request. Don't go back to one box per code: you cannot reflect on a taxonomy label, and
+  faced with five blank boxes a learner fills none, which is the same focused-WCF finding
+  that caps active targets at three. The note field carries the pattern's *question*
+  (keyed by taxonomy group), never its `hint` — the hint is the rule, and printing it
+  answers what's being asked.
 - **Review means produce, never recall.** No flashcards, no cloze drills. If a
   pattern needs resurfacing it comes back as a new writing task that obligates it.
 - **No live as-you-type correction.** Retrieval effort is the mechanism.
@@ -118,6 +131,11 @@ positional, not provider-specific. `COMPAT_*` secrets are also read under their 
   internalization that never happened — while the same error re-entered the working list
   at rung 1, discarding the rungs already climbed. That fold is the app's only progress
   metric; treat a false positive there as a data-corruption bug.
+- **The review is frozen when the session reaches it, and reads the pre-session ledger.**
+  `buildReview` is called once, on the transition into the review step, because
+  `completeSession` rebuilds the ledger underneath it — recomputing afterwards would make
+  "seen 3× before" silently start counting today. It also means the review survives the
+  autosave/restore round-trip; a snapshot written before the step existed recomputes it.
 - **A failed write must be visible and must not lose work.** `completeSession` flags a
   failed insert `pending` instead of dropping it, `mergeSessions` protects it from being
   clobbered by the next load, and `retryPending` re-sends it. `loadError` / `syncError`

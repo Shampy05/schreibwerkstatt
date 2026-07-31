@@ -43,8 +43,18 @@ export function isSameAsAny(error, candidates) {
 // actually needed. This is the ledger's progress signal (L4 → L2 → L1 =
 // internalization), so a false positive here invents development that did not
 // happen.
+//
+// The correction rides along so the end-of-session review can show the gap the
+// learner just closed. It is dropped when the engine did not supply one, rather
+// than substituted with the quote — an absent correction and a correction
+// identical to the quote mean different things.
 export function resolveWorking(working, stillFlagged) {
   return (working || [])
     .filter((old) => !(stillFlagged || []).some((n) => sameError(n, old)))
-    .map((old) => ({ quote: old.quote, patternCode: old.patternCode, rung: old.revealedRung }))
+    .map((old) => ({
+      quote: old.quote,
+      patternCode: old.patternCode,
+      rung: old.revealedRung,
+      ...(old.correction ? { correction: old.correction } : {}),
+    }))
 }

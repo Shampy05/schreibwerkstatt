@@ -5,17 +5,18 @@ import { analyzeDraft, generateTask, hasEngine } from '../lib/engine'
 
 import { normalizeLevel, levelDescriptor } from '../lib/level'
 import { isTaskFresh } from '../lib/taskCache'
-import { sessionPatternCodes } from '../lib/ledger'
+import { MAX_ACTIVE_TARGETS } from '../lib/ledger'
 import { matchError, isSameAsAny, resolveWorking } from '../lib/errorMatch'
 import { loadDraft, saveDraft, clearDraft } from '../lib/store'
 import { findHypothesisMarks, removeMarkAt, removeAllMarks } from '../lib/hypothesisMarks'
 import { patternFor } from '../lib/taxonomy'
-import { rungTrajectory } from '../lib/ladder'
+import { buildReview, promotionCandidate } from '../lib/review'
+import { rungLabel } from '../lib/ladder'
 import { useStore } from '../composables/useStore'
 import { useAuth } from '../composables/useAuth'
 import FeedbackPanel from './FeedbackPanel.vue'
 
-const { state, completeSession, setCurrentTask, ceiling, todayStr } = useStore()
+const { state, completeSession, setCurrentTask, setActiveTargets, ceiling, todayStr } = useStore()
 const { userId } = useAuth()
 const level = computed(() => normalizeLevel(state.settings.cefrLevel))
 const sentenceRange = computed(() => levelDescriptor(level.value).sentences)
@@ -28,7 +29,11 @@ const taskFellBack = ref('')
 const fromCache = ref(false)
 const draft = ref('')
 const rewrite = ref('')
-const praise = ref('')
+// Praise for the FIRST draft only, and never overwritten by a later check.
+// Re-analysing the corrected text and praising that congratulates the learner
+// for corrections the engine handed them; the unaided draft is the only text
+// they actually produced.
+const draftPraise = ref('')
 const busy = ref(false)
 const errorMsg = ref('')
 const checkCount = ref(0)
@@ -51,6 +56,18 @@ const working = ref([])
 const recorded = ref([])
 // Languaging notes, patternCode → text.
 const notes = ref({})
+// Patterns the learner explicitly passed on. A blank box is ambiguous — it
+// could mean "nothing to say" or "I'll get to it"; a skip is an answer.
+const skipped = ref([])
+// The remaining patterns' note fields, revealed on request.
+const showAllNotes = ref(false)
+// The review is frozen when the session reaches this step. It reads the ledger
+// as it stands BEFORE this session lands — which is what makes "3rd time" mean
+// three previous times — and completeSession rebuilds that ledger underneath us.
+const review = ref({ fixes: [], patterns: [] })
+// Set when a pattern is promoted to an active target from the done screen, so
+// the offer can be replaced by a confirmation instead of silently vanishing.
+const promoted = ref('')
 
 let nextId = 1
 function toWorking(errors, prior = []) {
@@ -135,7 +152,7 @@ function snapshot() {
     prompt: prompt.value,
     draft: draft.value,
     rewrite: rewrite.value,
-    praise: praise.value,
+    draftPraise: draftPraise.value,
     checkCount: checkCount.value,
     analysisVia: analysisVia.value,
     gradedByFallback: gradedByFallback.value,
@@ -143,6 +160,8 @@ function snapshot() {
     working: working.value,
     recorded: recorded.value,
     notes: notes.value,
+    skipped: skipped.value,
+    review: review.value,
     dismissed: dismissed.value,
     nextId,
   }
@@ -153,7 +172,7 @@ function restore(snap) {
   prompt.value = snap.prompt || null
   draft.value = snap.draft || ''
   rewrite.value = snap.rewrite || ''
-  praise.value = snap.praise || ''
+  draftPraise.value = snap.draftPraise || ''
   checkCount.value = snap.checkCount || 0
   analysisVia.value = snap.analysisVia || ''
   gradedByFallback.value = Boolean(snap.gradedByFallback)
@@ -161,6 +180,10 @@ function restore(snap) {
   working.value = snap.working || []
   recorded.value = snap.recorded || []
   notes.value = snap.notes || {}
+  skipped.value = snap.skipped || []
+  // Recomputed rather than trusted if it's missing: an autosave written before
+  // this step existed has no review, and the ledger hasn't moved since.
+  review.value = snap.review || makeReview()
   dismissed.value = snap.dismissed || []
   // Ids must not collide with the restored cards' ids.
   nextId = Math.max(snap.nextId || 1, ...working.value.map((w) => w.id + 1), 1)
@@ -181,7 +204,7 @@ function discardDraft() {
 }
 
 watch(
-  [step, draft, rewrite, working, recorded, notes, dismissed],
+  [step, draft, rewrite, working, recorded, notes, skipped, dismissed],
   () => scheduleSave(),
   { deep: true }
 )
@@ -201,6 +224,20 @@ function keepable(errors) {
   return errors.filter((e) => !isSameAsAny(e, dismissed.value))
 }
 
+// Freeze what the session amounted to, against the pre-session ledger.
+function makeReview() {
+  return buildReview({
+    recorded: recorded.value,
+    ledger: state.ledger,
+    activeTargets: state.settings.activeTargets,
+  })
+}
+
+function enterReview() {
+  review.value = makeReview()
+  step.value = 'languaging'
+}
+
 async function getFeedback() {
   errorMsg.value = ''
   busy.value = true
@@ -209,13 +246,13 @@ async function getFeedback() {
     const analysis = await analyzeDraft(text, { level: level.value })
     analysisVia.value = analysis.via
     gradedByFallback.value = analysis.fallback
-    praise.value = analysis.praise
+    draftPraise.value = analysis.praise
     analyzedText.value = text
     rewrite.value = text
     const errors = keepable(analysis.errors)
     if (analysis.clean || !errors.length) {
       working.value = []
-      step.value = 'languaging'
+      enterReview()
     } else {
       working.value = toWorking(errors)
       checkCount.value = 0
@@ -244,11 +281,10 @@ async function checkRewrite() {
     recorded.value = [...recorded.value, ...resolveWorking(working.value, still)]
     if (analysis.clean || !still.length) {
       working.value = []
-      step.value = 'languaging'
+      enterReview()
     } else {
       working.value = toWorking(still, working.value)
     }
-    if (analysis.praise) praise.value = analysis.praise
   } catch (e) {
     errorMsg.value = e.message
   } finally {
@@ -266,13 +302,64 @@ function dismissError(err) {
 
 function finishAnyway() {
   for (const old of working.value) {
-    recorded.value.push({ quote: old.quote, patternCode: old.patternCode, rung: old.revealedRung, unresolved: true })
+    recorded.value.push({
+      quote: old.quote,
+      patternCode: old.patternCode,
+      rung: old.revealedRung,
+      unresolved: true,
+      ...(old.correction ? { correction: old.correction } : {}),
+    })
   }
   working.value = []
-  step.value = 'languaging'
+  enterReview()
 }
 
-const sessionCodes = computed(() => sessionPatternCodes(recorded.value))
+// The patterns whose note field is showing: the ranked top few, plus everything
+// else once the learner asks for it. Asking for a note on every code contradicts
+// the focused-WCF stance the ledger already takes when it caps active targets.
+const askedPatterns = computed(() =>
+  showAllNotes.value ? review.value.patterns : review.value.patterns.filter((p) => p.askForNote)
+)
+const quietPatterns = computed(() => review.value.patterns.filter((p) => !p.askForNote))
+
+function skipNote(code) {
+  if (!skipped.value.includes(code)) skipped.value = [...skipped.value, code]
+  delete notes.value[code]
+}
+
+function unskipNote(code) {
+  skipped.value = skipped.value.filter((c) => c !== code)
+}
+
+// Offered only once the session has landed, so the count it's based on includes
+// today. Recomputes off live settings, so promoting makes the offer disappear.
+const promotable = computed(() =>
+  promotionCandidate(review.value.patterns, {
+    activeTargets: state.settings.activeTargets,
+    ceiling: ceiling.value,
+    max: MAX_ACTIVE_TARGETS,
+  })
+)
+
+function promote(code) {
+  promoted.value = code
+  setActiveTargets([...state.settings.activeTargets, code])
+}
+
+// "help L2", not "L2 · Show me where" — in a recap the ladder's own imperative
+// labels read as instructions rather than as how much help was needed, and the
+// bare level is the idiom the ledger's trajectories already use.
+function helpLabel(rung) {
+  return rung ? `help L${rung}` : ''
+}
+
+function helpTitle(rung) {
+  return rung ? `Rung ${rung} — ${rungLabel(rung)}` : ''
+}
+
+const writtenNotes = computed(() =>
+  Object.entries(notes.value).filter(([, text]) => (text || '').trim())
+)
 
 // The final text shouldn't carry the scaffolding you wrote to think with. Not
 // auto-stripped: a real question mark is indistinguishable by rule, so each one
@@ -310,10 +397,14 @@ function newSession() {
   step.value = 'prompt'
   draft.value = ''
   rewrite.value = ''
-  praise.value = ''
+  draftPraise.value = ''
   working.value = []
   recorded.value = []
   notes.value = {}
+  skipped.value = []
+  showAllNotes.value = false
+  review.value = { fixes: [], patterns: [] }
+  promoted.value = ''
   dismissed.value = []
   checkCount.value = 0
   errorMsg.value = ''
@@ -474,14 +565,10 @@ const wordCount = computed(() => draft.value.trim().split(/\s+/).filter(Boolean)
       </div>
     </section>
 
-    <!-- Step: languaging -->
-    <section v-else-if="step === 'languaging'" class="rounded-xl border border-stone-200 bg-white p-6 shadow-sm">
-      <p class="text-xs font-semibold uppercase tracking-wide text-stone-400">
-        {{ sessionCodes.length ? 'One sentence per pattern' : 'Clean text!' }}
-      </p>
-      <p v-if="praise" class="mt-2 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800">{{ praise }}</p>
-
-      <div v-if="marks.length" class="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2">
+    <!-- Step: review (recap → reflect → commit, in that order) -->
+    <div v-else-if="step === 'languaging'" class="space-y-4">
+      <!-- Cleaning the hypothesis marks gates the clean text, so it comes first. -->
+      <section v-if="marks.length" class="rounded-xl border border-amber-300 bg-amber-50 p-4">
         <p class="text-xs text-amber-900">
           Your text still has {{ marks.length }} “?”. Remove any that were hypothesis marks —
           the session is meant to end in a clean text. Real questions can stay.
@@ -506,45 +593,172 @@ const wordCount = computed(() => draft.value.trim().split(/\s+/).filter(Boolean)
         >
           None of these are real questions — remove all
         </button>
-      </div>
+      </section>
 
-      <template v-if="sessionCodes.length">
-        <p class="mt-2 text-sm text-stone-500">
-          In your own words: what's the rule, and what will you watch for next time? (Writing it measurably helps — skip only if truly stuck.)
-        </p>
-        <div v-for="code in sessionCodes" :key="code" class="mt-4">
-          <p class="text-sm font-medium">
-            <span class="rounded bg-stone-200 px-1.5 py-0.5 font-mono text-xs">{{ code }}</span>
-            {{ patternFor(code)?.name }}
-          </p>
-          <input
-            v-model="notes[code]"
-            type="text"
-            class="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 text-sm focus:border-emerald-600 focus:outline-none"
-            placeholder="e.g. after weil the conjugated verb goes last — scan every weil-clause before submitting"
-          />
+      <!-- Band 1: what the session actually produced -->
+      <section class="rounded-xl border border-stone-200 bg-white p-6 shadow-sm">
+        <p class="text-xs font-semibold uppercase tracking-wide text-stone-400">Session review</p>
+
+        <div v-if="draftPraise" class="mt-2 rounded-lg bg-emerald-50 px-3 py-2">
+          <p class="text-sm text-emerald-800">{{ draftPraise }}</p>
+          <p class="mt-1 text-xs text-emerald-700/70">— on your first draft, before any feedback.</p>
         </div>
-      </template>
-      <p v-else class="mt-2 text-sm text-stone-600">No errors to log — the session goes straight to the ledger.</p>
 
-      <button class="mt-5 rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800" @click="finishSession">
-        Finish session
-      </button>
-    </section>
+        <template v-if="review.fixes.length">
+          <p class="mt-4 text-xs font-semibold uppercase tracking-wide text-stone-400">
+            What you closed — {{ review.fixes.length }} across
+            {{ checkCount }} check{{ checkCount === 1 ? '' : 's' }}
+          </p>
+          <ul class="mt-1 divide-y divide-stone-100">
+            <li v-for="(f, i) in review.fixes" :key="i" class="flex flex-wrap items-baseline gap-x-2 py-2">
+              <span class="rounded bg-stone-200 px-1.5 py-0.5 font-mono text-xs">{{ f.patternCode }}</span>
+              <span
+                lang="de"
+                class="font-serif text-sm underline decoration-amber-500 decoration-wavy underline-offset-4"
+              >{{ f.quote }}</span>
+              <template v-if="f.correction">
+                <span class="text-stone-300">→</span>
+                <span lang="de" class="font-serif text-sm font-medium text-emerald-900">{{ f.correction }}</span>
+              </template>
+              <span class="ml-auto shrink-0 text-xs text-stone-400" :title="helpTitle(f.rung)">
+                {{ helpLabel(f.rung) }}<span v-if="f.unresolved" class="text-amber-700"> · left unfixed</span>
+              </span>
+            </li>
+          </ul>
+        </template>
+        <p v-else class="mt-3 text-sm text-stone-600">A clean first draft — nothing to work through.</p>
+      </section>
+
+      <!-- Band 2: the one or two patterns worth a sentence -->
+      <section class="rounded-xl border border-stone-200 bg-white p-6 shadow-sm">
+        <template v-if="review.patterns.length">
+          <p class="text-xs font-semibold uppercase tracking-wide text-stone-400">Worth writing down</p>
+          <p class="mt-1 text-sm text-stone-500">
+            One sentence in your own words. Writing it measurably helps — and only the patterns that
+            cost you the most help are asked about, because a wall of empty boxes gets none of them
+            filled.
+          </p>
+
+          <div v-for="p in askedPatterns" :key="p.code" class="mt-4 rounded-lg border border-stone-200 p-4">
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="rounded bg-stone-200 px-1.5 py-0.5 font-mono text-xs">{{ p.code }}</span>
+              <span class="text-sm font-medium">{{ p.name }}</span>
+              <span v-if="p.isTarget" class="rounded bg-emerald-100 px-1.5 py-0.5 text-xs text-emerald-900">
+                active target
+              </span>
+              <span v-if="p.unresolved" class="rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-900">
+                still unfixed
+              </span>
+            </div>
+
+            <ul class="mt-2 space-y-0.5">
+              <li v-for="(o, i) in p.occurrences" :key="i" class="text-sm">
+                <span lang="de" class="font-serif text-stone-700">„{{ o.quote }}“</span>
+                <template v-if="o.correction">
+                  <span class="text-stone-300"> → </span>
+                  <span lang="de" class="font-serif text-emerald-900">{{ o.correction }}</span>
+                </template>
+              </li>
+            </ul>
+
+            <p v-if="p.priorCount" class="mt-2 text-xs text-stone-500">
+              Seen {{ p.priorCount }}× before · help {{ p.priorTrajectory || '—' }} · last
+              {{ p.priorLastSeen }}
+              <!-- A single prior rung is not a trajectory, so the gloss would be noise. -->
+              <span v-if="p.priorTrajectory.includes('→')" class="text-stone-400">
+                (falling levels = internalizing)
+              </span>
+            </p>
+
+            <div v-if="p.priorNote" class="mt-2 rounded-lg bg-stone-50 px-3 py-2">
+              <p class="text-xs text-stone-400">You wrote on {{ p.priorNote.date }}:</p>
+              <p class="mt-0.5 text-sm text-stone-600">“{{ p.priorNote.text }}”</p>
+              <button
+                class="mt-1 text-xs text-emerald-700 underline hover:text-emerald-900"
+                @click="notes[p.code] = p.priorNote.text"
+              >
+                Start from that and sharpen it
+              </button>
+            </div>
+
+            <template v-if="!skipped.includes(p.code)">
+              <label :for="`note-${p.code}`" class="mt-3 block text-sm text-stone-600">
+                {{ p.question }}
+              </label>
+              <input
+                :id="`note-${p.code}`"
+                v-model="notes[p.code]"
+                type="text"
+                class="mt-1 w-full rounded-lg border border-stone-300 px-3 py-2 text-sm focus:border-emerald-600 focus:outline-none"
+                placeholder="the rule as you'd tell it to yourself"
+              />
+              <button
+                class="mt-1 text-xs text-stone-400 underline hover:text-stone-600"
+                @click="skipNote(p.code)"
+              >
+                Nothing to say about this one
+              </button>
+            </template>
+            <p v-else class="mt-3 text-xs text-stone-400">
+              Skipped.
+              <button class="underline hover:text-stone-600" @click="unskipNote(p.code)">Undo</button>
+            </p>
+          </div>
+
+          <p v-if="quietPatterns.length && !showAllNotes" class="mt-4 text-xs text-stone-400">
+            Also logged to the ledger:
+            <span v-for="(p, i) in quietPatterns" :key="p.code">
+              <span class="font-mono">{{ p.code }}</span>{{ i < quietPatterns.length - 1 ? ', ' : '' }}
+            </span>
+            ·
+            <button class="underline hover:text-stone-600" @click="showAllNotes = true">
+              write notes for these too
+            </button>
+          </p>
+        </template>
+        <p v-else class="text-sm text-stone-600">No errors to log — the session goes straight to the ledger.</p>
+
+        <button
+          class="mt-5 rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800"
+          @click="finishSession"
+        >
+          Finish session
+        </button>
+      </section>
+    </div>
 
     <!-- Step: done -->
     <section v-else-if="step === 'done'" class="rounded-xl border border-stone-200 bg-white p-6 shadow-sm">
       <p class="text-xs font-semibold uppercase tracking-wide text-stone-400">Session complete</p>
       <p class="mt-2 text-sm text-stone-600">
-        {{ recorded.length ? `${recorded.length} error${recorded.length === 1 ? '' : 's'} worked through across ${checkCount} check${checkCount === 1 ? '' : 's'}.` : 'A clean first draft — logged.' }}
+        {{ review.fixes.length ? `${review.fixes.length} error${review.fixes.length === 1 ? '' : 's'} worked through across ${checkCount} check${checkCount === 1 ? '' : 's'}, and they're in your ledger.` : 'A clean first draft — logged.' }}
       </p>
-      <ul v-if="recorded.length" class="mt-3 space-y-1 text-sm">
-        <li v-for="(e, i) in recorded" :key="i" class="flex items-center gap-2">
-          <span class="rounded bg-stone-200 px-1.5 py-0.5 font-mono text-xs">{{ e.patternCode }}</span>
-          <span class="text-stone-600">„{{ e.quote }}“</span>
-          <span class="ml-auto text-xs text-stone-400">help needed: {{ rungTrajectory([e.rung]) }}{{ e.unresolved ? ' · unresolved' : '' }}</span>
+
+      <ul v-if="writtenNotes.length" class="mt-3 space-y-1">
+        <li v-for="[code, text] in writtenNotes" :key="code" class="text-sm text-stone-600">
+          <span class="rounded bg-stone-200 px-1.5 py-0.5 font-mono text-xs">{{ code }}</span>
+          “{{ text }}”
         </li>
       </ul>
+
+      <!-- The evidence is freshest right now, so this is where the loop closes. -->
+      <div v-if="promoted" class="mt-4 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+        Now targeting <strong>{{ promoted }}</strong> — future tasks will quietly obligate it.
+      </div>
+      <div v-else-if="promotable" class="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+        <p class="text-sm text-emerald-900">
+          <strong>{{ promotable }}</strong> — {{ patternFor(promotable)?.name }} — has come up more
+          than once now. Make it an active target? Tasks will be built to obligate it, without
+          naming it.
+        </p>
+        <button
+          class="mt-2 rounded border border-emerald-600 px-2.5 py-1 text-xs text-emerald-800 hover:bg-emerald-100"
+          @click="promote(promotable)"
+        >
+          Target it
+        </button>
+      </div>
+
       <button class="mt-5 rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800" @click="newSession">
         New session
       </button>
