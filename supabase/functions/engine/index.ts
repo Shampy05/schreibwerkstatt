@@ -24,6 +24,59 @@ const json = (body: unknown, status = 200) =>
     headers: { ...CORS, 'Content-Type': 'application/json' },
   })
 
+// The model call is streamed back, not because we stream tokens — we don't, the
+// client needs the whole JSON object before it can do anything — but because
+// Cloudflare's ~100s ceiling is a time-to-FIRST-byte limit. A buffered response
+// must arrive complete inside it; a streamed one only has to *start*. So we open
+// the response immediately, emit an SSE comment every few seconds while the
+// model thinks, and send the payload as one frame whenever it lands. The 524
+// that produced null-status "CORS request did not succeed" errors in the browser
+// simply cannot happen once bytes are flowing.
+//
+// The cost: HTTP status is committed before the outcome is known, so every
+// streamed reply is a 200 and errors ride in the frame as { error }. The client
+// already keys off `data.error`, and auth failures still answer with real status
+// codes because they resolve before the stream opens.
+const HEARTBEAT_MS = 5_000
+
+function streamed(work: () => Promise<unknown>) {
+  const encoder = new TextEncoder()
+  const body = new ReadableStream({
+    async start(controller) {
+      const beat = setInterval(() => {
+        // An SSE comment: keeps the connection warm, ignored by every parser.
+        try {
+          controller.enqueue(encoder.encode(': waiting\n\n'))
+        } catch {
+          /* stream already closed */
+        }
+      }, HEARTBEAT_MS)
+      // One byte before anything else, so the clock the proxy is watching stops
+      // the moment the request arrives rather than when the model answers.
+      controller.enqueue(encoder.encode(': open\n\n'))
+      let payload: unknown
+      try {
+        payload = await work()
+      } catch (e) {
+        payload = { error: (e as Error).message || 'The engine failed unexpectedly.' }
+      } finally {
+        clearInterval(beat)
+      }
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`))
+      controller.close()
+    },
+  })
+  return new Response(body, {
+    headers: {
+      ...CORS,
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      // Belt and braces against any buffering proxy that would defeat the point.
+      'X-Accel-Buffering': 'no',
+    },
+  })
+}
+
 // Two interchangeable providers, either of which may lead:
 //   compat    — any OpenAI-compatible gateway (OpenCode Zen/Go, DeepSeek, OpenRouter)
 //   anthropic — the Messages API
@@ -55,38 +108,28 @@ const COMPAT_BASE_URL = Deno.env.get('COMPAT_BASE_URL') ?? Deno.env.get('FALLBAC
 const hasAnthropic = Boolean(ANTHROPIC_API_KEY)
 const hasCompat = Boolean(COMPAT_MODEL && COMPAT_API_KEY && COMPAT_BASE_URL)
 
-// Supabase kills an Edge Function at 150s wall clock (free plan) and 504s on a
-// 150s idle timeout. A killed isolate sends no response headers at all, which
-// the browser reports as "CORS request did not succeed" with a null status —
-// an opaque failure that looks like a config problem and isn't. So bound every
-// upstream call ourselves and always come back with real JSON well before the
-// platform intervenes.
+// Supabase kills an Edge Function at 150s wall clock (free plan). A killed
+// isolate sends no response headers at all, which the browser reports as "CORS
+// request did not succeed" with a null status — an opaque failure that looks
+// like a config problem and isn't. So bound every upstream call ourselves and
+// always come back with real JSON well before the platform intervenes.
 //
-// The budget is well under Supabase's 150s because the endpoint sits behind
-// Cloudflare (see `server: cloudflare` on every response), whose standard proxy
-// read timeout is 100s — and a 524 from an intermediary arrives without our CORS
-// headers, so the browser reports it as a failed CORS request with a null
-// status, exactly the symptom we are trying to eliminate. Budget for the
-// tightest limit in the chain, not the one we control.
+// Cloudflare's ~100s read timeout used to be the binding constraint here, and
+// budgeting against it was a losing game: the budget cannot see the cold start
+// or the auth round trip that precede it, so a value close to the limit lands
+// over it whenever the isolate is cold. Two rounds of tuning (85s, then 55s)
+// were both wrong in the same way — the first went over, the second gave up on
+// a model that simply needed longer. Streaming the reply (see `streamed`)
+// removes that ceiling instead of negotiating with it, because the proxy limit
+// is on the first byte and the first byte now leaves immediately.
 //
-// The budget is NOT the whole wall clock. Cold-starting the isolate (it imports
-// supabase-js from jsr) and the auth.getUser() round trip both happen before the
-// budget starts counting, and serializing the response happens after it. An
-// 85s attempt inside a 90s budget therefore lands the response somewhere in the
-// low-to-mid 90s — under the 100s limit on paper, and over it whenever the cold
-// start is slow. That configuration was live, and it is what produced the
-// intermittent null-status failures: not a wrong value, an absent margin.
-// 70s of budget leaves ~25s for everything the budget can't see.
-//
-// The ceiling is ENFORCED here, not merely defaulted. These are secrets, and a
-// secret set once outlives the code that wanted it, so a value tuned against an
-// older understanding of the limit silently overrides the default and puts us
-// straight back over — where the failure is a null-status CORS error in the
-// browser and nothing at all in our logs, because our code never got to return.
-// A stale or fat-fingered value may make this function give up sooner; it must
-// never let it outlive the proxy. Same for a non-numeric value, which used to
-// become NaN and take every timeout with it.
-const HARD_CEILING_MS = 75_000
+// So the only remaining bound is Supabase's own 150s, which we do not get to
+// argue with. The ceiling is ENFORCED, not merely defaulted: these are secrets,
+// and a secret set once outlives the code that wanted it — ENGINE_BUDGET_MS was
+// found live at 90000, tuned against an understanding of the limit that no
+// longer applied. Env vars may lower these values; they can never raise them.
+// A non-numeric value also used to become NaN and take every timeout with it.
+const HARD_CEILING_MS = 130_000
 
 function envMs(name: string, fallback: number, ceiling: number) {
   const raw = Number(Deno.env.get(name) ?? '')
@@ -94,8 +137,8 @@ function envMs(name: string, fallback: number, ceiling: number) {
   return Math.min(value, ceiling)
 }
 
-const BUDGET_MS = envMs('ENGINE_BUDGET_MS', 70_000, HARD_CEILING_MS)
-const ATTEMPT_MS = envMs('ENGINE_ATTEMPT_MS', 55_000, BUDGET_MS)
+const BUDGET_MS = envMs('ENGINE_BUDGET_MS', 120_000, HARD_CEILING_MS)
+const ATTEMPT_MS = envMs('ENGINE_ATTEMPT_MS', 110_000, BUDGET_MS)
 const MIN_ATTEMPT_MS = 5_000
 
 // Transient upstream conditions worth one immediate retry. We have seen the
@@ -259,36 +302,41 @@ Deno.serve(async (req) => {
   const chain = ORDER.filter((p) => (p === 'anthropic' ? hasAnthropic : hasCompat))
   if (!chain.length) return json({ error: 'No model configured on the server.' }, 500)
 
-  const started = Date.now()
-  const deadline = started + BUDGET_MS
-  const failures: string[] = []
-  // Every failure says how long it took. Without it, "too slow" and "refused
-  // instantly" reach the learner as the same sentence, and the only way to tell
-  // them apart is the dashboard.
-  const elapsed = () => `${((Date.now() - started) / 1000).toFixed(1)}s`
+  // Everything below happens inside the stream, so the connection is already
+  // open and the proxy's first-byte clock has stopped before the model is asked
+  // anything. Failures come back as { error } frames, not HTTP statuses.
+  return streamed(async () => {
+    const started = Date.now()
+    const deadline = started + BUDGET_MS
+    const failures: string[] = []
+    // Every failure says how long it took. Without it, "too slow" and "refused
+    // instantly" reach the learner as the same sentence, and the only way to
+    // tell them apart is the dashboard.
+    const elapsed = () => `${((Date.now() - started) / 1000).toFixed(1)}s`
 
-  for (const [i, provider] of chain.entries()) {
-    // Two attempts per provider, the second only for transient failures.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const remaining = deadline - Date.now()
-      if (remaining < MIN_ATTEMPT_MS) {
-        failures.push(`gave up after ${elapsed()} to stay inside the platform's limit`)
-        return json({ error: failures.join(' — ') }, 504)
-      }
-      const timeoutMs = Math.min(ATTEMPT_MS, remaining)
-      try {
-        const result =
-          provider === 'anthropic'
-            ? await callAnthropic(system, userMsg, maxTokens, body.schema, timeoutMs)
-            : await callCompat(system, userMsg, maxTokens, timeoutMs)
-        return json({ ...result, fallback: i > 0, retried: attempt > 0 })
-      } catch (e) {
-        const err = e as Upstream
-        failures.push(err.message)
-        if (!err.retryable || attempt === 1) break
-        await sleep(1_200)
+    for (const [i, provider] of chain.entries()) {
+      // Two attempts per provider, the second only for transient failures.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const remaining = deadline - Date.now()
+        if (remaining < MIN_ATTEMPT_MS) {
+          failures.push(`gave up after ${elapsed()} to stay inside the platform's limit`)
+          return { error: failures.join(' — ') }
+        }
+        const timeoutMs = Math.min(ATTEMPT_MS, remaining)
+        try {
+          const result =
+            provider === 'anthropic'
+              ? await callAnthropic(system, userMsg, maxTokens, body.schema, timeoutMs)
+              : await callCompat(system, userMsg, maxTokens, timeoutMs)
+          return { ...result, fallback: i > 0, retried: attempt > 0 }
+        } catch (e) {
+          const err = e as Upstream
+          failures.push(err.message)
+          if (!err.retryable || attempt === 1) break
+          await sleep(1_200)
+        }
       }
     }
-  }
-  return json({ error: `${failures.join(' — ')} (after ${elapsed()})` }, 502)
+    return { error: `${failures.join(' — ')} (after ${elapsed()})` }
+  })
 })

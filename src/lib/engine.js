@@ -23,39 +23,94 @@ import { supabase, hasSupabase } from './supabase'
 export const hasEngine = hasSupabase
 
 // One call to the proxy. Returns { parsed, via, fallback }.
+//
+// Deliberately `fetch` rather than `supabase.functions.invoke`: the function
+// replies as an event stream, and invoke() buffers and JSON-parses the whole
+// body. The stream is not there to show tokens arriving — the client needs the
+// complete object before it can do anything — it exists because the ~100s proxy
+// limit in front of the function is a time-to-FIRST-byte limit. The function
+// opens the response instantly and heartbeats while the model thinks, so a slow
+// analysis can no longer die as a null-status "CORS request did not succeed".
+// The payload is one `data:` frame at the end; heartbeats are SSE comments.
 async function invokeEngine({ system, user, maxTokens, schema }) {
   if (!hasSupabase) {
     throw new Error('Supabase is not configured — set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.')
   }
-  const { data, error } = await supabase.functions.invoke('engine', {
-    body: { system, user, maxTokens, schema },
-  })
-  if (error) {
-    // FunctionsHttpError carries the real message in the response body; without
-    // this you only ever see a generic "non-2xx status code".
+  const { data: sessionData } = await supabase.auth.getSession()
+  const token = sessionData?.session?.access_token
+  if (!token) throw new Error('You are signed out — sign in again to use the engine.')
+
+  let res
+  try {
+    res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/engine`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${token}`,
+        apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
+      },
+      body: JSON.stringify({ system, user, maxTokens, schema }),
+    })
+  } catch (e) {
+    throw new Error(`Couldn't reach the engine (${e.message}). Check your connection and try again.`)
+  }
+
+  // Auth and validation failures resolve before the stream opens, so they still
+  // arrive as real status codes with a JSON body.
+  if (!res.ok) {
     let detail = ''
     try {
-      const body = await error.context?.json?.()
-      if (body?.error) detail = body.error
+      detail = (await res.json())?.error || ''
     } catch {
-      /* no readable body — fall through to the transport-level message */
+      /* no readable body */
     }
-    if (!detail) {
-      // No body at all means the request never completed: the function was cut
-      // off mid-flight, or the network dropped. The browser surfaces that as a
-      // CORS failure with a null status, which reads like a config problem and
-      // isn't one — so say what actually happened.
-      detail = `The engine didn't answer (${error.message}). It may still have been working when the connection dropped — try again.`
-    }
-    throw new Error(detail)
+    throw new Error(detail || `The engine refused the request (HTTP ${res.status}).`)
   }
-  if (data?.error) throw new Error(data.error)
-  if (!data?.content) throw new Error('The engine returned no content.')
+
+  const payload = await readEventStream(res)
+  if (payload?.error) throw new Error(payload.error)
+  if (!payload?.content) throw new Error('The engine returned no content.')
   return {
-    parsed: parseJsonText(data.content),
-    via: data.via,
-    fallback: Boolean(data.fallback),
+    parsed: parseJsonText(payload.content),
+    via: payload.via,
+    fallback: Boolean(payload.fallback),
   }
+}
+
+// Read SSE until the first `data:` frame. Heartbeats (lines starting `:`) are
+// skipped. A stream that ends without one means the connection dropped
+// mid-flight — worth saying plainly, since it reads like a config error.
+//
+// Exported for tests: a frame is not guaranteed to arrive in one chunk, and
+// getting the reassembly wrong fails only under network conditions that are
+// awkward to reproduce by hand.
+export async function readEventStream(res) {
+  if (!res.body) throw new Error('The engine returned an empty response.')
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    // Frames are separated by a blank line; a frame may span several reads.
+    let split
+    while ((split = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, split)
+      buffer = buffer.slice(split + 2)
+      const line = frame.split('\n').find((l) => l.startsWith('data:'))
+      if (!line) continue
+      reader.cancel().catch(() => {})
+      try {
+        return JSON.parse(line.slice(5).trim())
+      } catch {
+        throw new Error('The engine sent a malformed response.')
+      }
+    }
+  }
+  throw new Error(
+    "The engine didn't finish answering — the connection dropped mid-analysis. Try again."
+  )
 }
 
 // How many errors one analysis pass may report.

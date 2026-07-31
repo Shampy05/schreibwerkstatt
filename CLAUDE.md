@@ -121,15 +121,25 @@ positional, not provider-specific. `COMPAT_*` secrets are also read under their 
   `verify_jwt = true` alone leaves the function an open proxy on your bill. `index.ts`
   also requires `auth.getUser()` to resolve *and* the email to be in `ALLOWED_EMAILS`,
   because Supabase Auth permits public signup.
-- **The time budget is not the wall clock, and it is clamped in code.** Cold start and
-  `auth.getUser()` run before the budget starts counting and the response is serialized
-  after it, so a budget set close to the limit lands *over* it whenever the cold start is
-  slow. That is what "CORS request did not succeed", status null, means here: Cloudflare's
-  ~100s read timeout fired, its 524 carried none of our CORS headers, and *nothing appears
-  in the function logs* because our code never returned. Measured live: `ENGINE_ATTEMPT_MS`
-  85000 inside `ENGINE_BUDGET_MS` 90000 produced exactly this. `HARD_CEILING_MS` (75s) now
-  wins over both — env vars may lower these values, never raise them — because a secret set
-  once outlives the code that wanted it.
+- **The engine replies as an event stream, and that is a timeout fix, not a UX feature.**
+  The client needs the whole JSON object before it can do anything, so nothing renders
+  progressively. The stream exists because the ~100s proxy limit in front of the function
+  is a time-to-**first**-byte limit: a buffered reply must arrive complete inside it, a
+  streamed one only has to start. The function opens the response immediately and emits an
+  SSE comment every 5s while the model thinks; the payload is one `data:` frame at the end.
+  Don't "simplify" this back to `supabase.functions.invoke` — it buffers and JSON-parses
+  the whole body, and the null-status "CORS request did not succeed" failures come straight
+  back. Two rounds of budget tuning (85s, then 55s) were both wrong in the same way before
+  this: the first ran past the proxy, the second gave up on a model that just needed longer.
+- **Streamed replies are always HTTP 200; errors ride in the frame.** The status is
+  committed before the outcome is known. Anything reading engine output must key off
+  `data.error`. Auth and validation failures still answer with real status codes, because
+  they resolve before the stream opens.
+- **The time budget is clamped in code.** Supabase's own 150s wall clock is the only bound
+  left, and `HARD_CEILING_MS` (130s) wins over `ENGINE_BUDGET_MS`/`ENGINE_ATTEMPT_MS`. A
+  secret set once outlives the code that wanted it — `ENGINE_BUDGET_MS` was found live at
+  90000, tuned against a limit that no longer applies. Env vars may lower these values;
+  they can never raise them.
 - **The ledger is derived, not stored.** `buildLedger(sessions)` folds it from sessions,
   oldest-first so rung trajectories read correctly. Don't add a ledger table — that
   creates two sources of truth that drift.
