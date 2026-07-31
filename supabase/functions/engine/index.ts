@@ -55,8 +55,15 @@ const hasCompat = Boolean(COMPAT_MODEL && COMPAT_API_KEY && COMPAT_BASE_URL)
 // an opaque failure that looks like a config problem and isn't. So bound every
 // upstream call ourselves and always come back with real JSON well before the
 // platform intervenes.
-const BUDGET_MS = Number(Deno.env.get('ENGINE_BUDGET_MS') ?? 120_000)
-const ATTEMPT_MS = Number(Deno.env.get('ENGINE_ATTEMPT_MS') ?? 75_000)
+//
+// The budget is well under Supabase's 150s because the endpoint sits behind
+// Cloudflare (see `server: cloudflare` on every response), whose standard proxy
+// read timeout is 100s — and a 524 from an intermediary arrives without our CORS
+// headers, so the browser reports it as a failed CORS request with a null
+// status, exactly the symptom we are trying to eliminate. Budget for the
+// tightest limit in the chain, not the one we control.
+const BUDGET_MS = Number(Deno.env.get('ENGINE_BUDGET_MS') ?? 85_000)
+const ATTEMPT_MS = Number(Deno.env.get('ENGINE_ATTEMPT_MS') ?? 55_000)
 const MIN_ATTEMPT_MS = 5_000
 
 // Transient upstream conditions worth one immediate retry. We have seen the
@@ -82,11 +89,16 @@ async function fetchUpstream(url: string, init: RequestInit, timeoutMs: number, 
     res = await fetch(url, { ...init, signal: ctrl.signal })
   } catch (e) {
     const aborted = (e as Error).name === 'AbortError'
+    // A timeout is NOT retryable. The model isn't glitching, it's slow, so a
+    // second attempt spends the rest of the budget to arrive at the same place
+    // — and pushes total wall time past the intermediary limits this timeout
+    // exists to stay under. Move to the next provider, or fail with a message
+    // that names the real problem.
     throw upstreamError(
       aborted
-        ? `${label} did not respond within ${Math.round(timeoutMs / 1000)}s`
+        ? `${label} did not respond within ${Math.round(timeoutMs / 1000)}s — it may simply be too slow for this setup`
         : `${label} unreachable: ${(e as Error).message}`,
-      true
+      !aborted
     )
   } finally {
     clearTimeout(timer)
