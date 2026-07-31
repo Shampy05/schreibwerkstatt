@@ -57,6 +57,18 @@ async function invokeEngine({ system, user, maxTokens, schema }) {
   }
 }
 
+// How many errors one analysis pass may report.
+//
+// Measured: this gateway generates at roughly 90 tokens/s, so a 25-error
+// analysis with two-sentence explanations takes ~43s — close enough to the
+// intermediary timeouts to fail outright, and the cost is entirely output
+// length. Capping it is not merely a latency fix, though: focused feedback
+// beats unfocused (Kang & Han; the same finding behind MAX_ACTIVE_TARGETS),
+// and a wall of 27 cards is worse teaching than a dozen well-chosen ones.
+// Nothing is lost — the rewrite is re-analysed, so anything held back surfaces
+// on the next pass, which is how the loop already works.
+export const MAX_REPORTED_ERRORS = 12
+
 const ANALYSIS_SCHEMA = {
   type: 'object',
   properties: {
@@ -85,7 +97,7 @@ const ANALYSIS_SCHEMA = {
           explanation: {
             type: 'string',
             description:
-              'Metalinguistic explanation (in English) of the rule as it applies to this specific error. MUST NOT contain or paraphrase the corrected form — the learner should still have to produce the fix themselves.',
+              'ONE sentence (two only if genuinely necessary). Metalinguistic explanation (in English) of the rule as it applies to this specific error. MUST NOT contain or paraphrase the corrected form — the learner should still have to produce the fix themselves.',
           },
           correction: {
             type: 'string',
@@ -111,7 +123,9 @@ const analysisSystem = (level) => `You are the analysis engine inside a German w
 ${analysisLevelBlock(level)}
 
 Rules:
-- Report every genuine error, but never invent one. If a form is acceptable standard German, leave it alone. Colloquial-but-correct is not an error.
+- Never invent an error. If a form is acceptable standard German, leave it alone. Colloquial-but-correct is not an error.
+- Report AT MOST ${MAX_REPORTED_ERRORS} errors. If the text has more, report the ${MAX_REPORTED_ERRORS} most worth working on and leave the rest — the learner rewrites and is re-analysed, so the remainder surfaces next pass. Priority: spans the learner marked with a trailing ?, then errors that block comprehension, then repeated patterns (report the clearest instance, not all of them), then the rest. Never pad the list with spelling when a structural error went unreported.
+- Keep "explanation" to one sentence. Length here costs the learner nothing but waiting.
 - Classify each error with exactly one code from the taxonomy below. When two codes could apply, pick the one naming the rule the learner actually broke.
 - "quote" must be an exact, verbatim, character-for-character substring of the learner's text. Keep it short but unambiguous (unique in the text if possible).
 - "explanation" states the rule as it applies here, in English, WITHOUT revealing or paraphrasing the corrected form. Name the trigger ("weil starts a subordinate clause, and subordinate clauses put the finite verb…") but stop before giving the answer.
@@ -128,7 +142,7 @@ ${taxonomyPromptBlock()}`
 // load-bearing on the fallback one.
 const ANALYSIS_JSON_SHAPE = `Respond with ONLY a JSON object — no prose, no markdown fence:
 {"clean": boolean, "errors": [{"quote": string, "sentence_index": integer, "pattern_code": string, "explanation": string, "correction": string}], "praise": string}
-"pattern_code" must be exactly one code from the taxonomy above. "clean" is true and "errors" empty when the text has no errors worth reporting.`
+"pattern_code" must be exactly one code from the taxonomy above. "clean" is true and "errors" empty when the text has no errors worth reporting. "errors" holds at most ${MAX_REPORTED_ERRORS} entries, and each "explanation" is one sentence.`
 
 const TASK_JSON_SHAPE = `Respond with ONLY a JSON object — no prose, no markdown fence:
 {"task": string, "requirements": [string], "obligates": [string], "glossary": [{"de": string, "en": string}]}
@@ -139,6 +153,7 @@ const TASK_JSON_SHAPE = `Respond with ONLY a JSON object — no prose, no markdo
 function normalizeErrors(raw, text) {
   const out = []
   for (const e of raw.errors || []) {
+    if (out.length === MAX_REPORTED_ERRORS) break
     if (!e || typeof e.quote !== 'string' || !CODE_SET.has(e.pattern_code)) continue
     out.push({
       quote: e.quote,
@@ -170,7 +185,9 @@ export async function analyzeDraft(text, { level } = {}) {
   const { parsed, via, fallback } = await invokeEngine({
     system: `${analysisSystem(level)}\n\n${ANALYSIS_JSON_SHAPE}`,
     user: `Analyze this learner text:\n\n${text}`,
-    maxTokens: 4096,
+    // Sized to the capped output above, not to headroom. Generation time is
+    // linear in tokens produced and the request has a hard ceiling.
+    maxTokens: 2048,
     schema: ANALYSIS_SCHEMA,
   })
 
