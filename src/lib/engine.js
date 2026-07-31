@@ -32,12 +32,19 @@ async function invokeEngine({ system, user, maxTokens, schema }) {
   if (error) {
     // FunctionsHttpError carries the real message in the response body; without
     // this you only ever see a generic "non-2xx status code".
-    let detail = error.message
+    let detail = ''
     try {
       const body = await error.context?.json?.()
       if (body?.error) detail = body.error
     } catch {
-      /* keep the generic message */
+      /* no readable body — fall through to the transport-level message */
+    }
+    if (!detail) {
+      // No body at all means the request never completed: the function was cut
+      // off mid-flight, or the network dropped. The browser surfaces that as a
+      // CORS failure with a null status, which reads like a config problem and
+      // isn't one — so say what actually happened.
+      detail = `The engine didn't answer (${error.message}). It may still have been working when the connection dropped — try again.`
     }
     throw new Error(detail)
   }

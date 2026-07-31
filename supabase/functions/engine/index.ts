@@ -49,60 +49,122 @@ const COMPAT_BASE_URL = Deno.env.get('COMPAT_BASE_URL') ?? Deno.env.get('FALLBAC
 const hasAnthropic = Boolean(ANTHROPIC_API_KEY)
 const hasCompat = Boolean(COMPAT_MODEL && COMPAT_API_KEY && COMPAT_BASE_URL)
 
-async function callAnthropic(system: string, user: string, maxTokens: number, schema: unknown) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'anthropic-beta': 'server-side-fallback-2026-07-01',
+// Supabase kills an Edge Function at 150s wall clock (free plan) and 504s on a
+// 150s idle timeout. A killed isolate sends no response headers at all, which
+// the browser reports as "CORS request did not succeed" with a null status —
+// an opaque failure that looks like a config problem and isn't. So bound every
+// upstream call ourselves and always come back with real JSON well before the
+// platform intervenes.
+const BUDGET_MS = Number(Deno.env.get('ENGINE_BUDGET_MS') ?? 120_000)
+const ATTEMPT_MS = Number(Deno.env.get('ENGINE_ATTEMPT_MS') ?? 75_000)
+const MIN_ATTEMPT_MS = 5_000
+
+// Transient upstream conditions worth one immediate retry. We have seen the
+// gateway return 503 inference_overloaded, which currently kills a whole
+// session's feedback for something that clears in a second.
+const RETRY_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504, 529])
+
+type Upstream = Error & { retryable?: boolean }
+
+function upstreamError(message: string, retryable: boolean): Upstream {
+  const e = new Error(message) as Upstream
+  e.retryable = retryable
+  return e
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+async function fetchUpstream(url: string, init: RequestInit, timeoutMs: number, label: string) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  let res: Response
+  try {
+    res = await fetch(url, { ...init, signal: ctrl.signal })
+  } catch (e) {
+    const aborted = (e as Error).name === 'AbortError'
+    throw upstreamError(
+      aborted
+        ? `${label} did not respond within ${Math.round(timeoutMs / 1000)}s`
+        : `${label} unreachable: ${(e as Error).message}`,
+      true
+    )
+  } finally {
+    clearTimeout(timer)
+  }
+  if (!res.ok) {
+    const body = (await res.text()).slice(0, 300)
+    throw upstreamError(`${label} ${res.status}: ${body}`, RETRY_STATUSES.has(res.status))
+  }
+  return res
+}
+
+async function callAnthropic(
+  system: string,
+  user: string,
+  maxTokens: number,
+  schema: unknown,
+  timeoutMs: number
+) {
+  const res = await fetchUpstream(
+    'https://api.anthropic.com/v1/messages',
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'server-side-fallback-2026-07-01',
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: maxTokens,
+        fallbacks: 'default',
+        system,
+        ...(schema ? { output_config: { format: { type: 'json_schema', schema } } } : {}),
+        messages: [{ role: 'user', content: user }],
+      }),
     },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: maxTokens,
-      fallbacks: 'default',
-      system,
-      ...(schema ? { output_config: { format: { type: 'json_schema', schema } } } : {}),
-      messages: [{ role: 'user', content: user }],
-    }),
-  })
-  if (!res.ok) throw new Error(`${MODEL} ${res.status}: ${(await res.text()).slice(0, 300)}`)
+    timeoutMs,
+    MODEL
+  )
   const data = await res.json()
   if (data.stop_reason === 'refusal') {
-    throw new Error('The feedback engine declined this text. Try rephrasing and re-checking.')
+    // A refusal is a decision, not a hiccup — retrying just spends money.
+    throw upstreamError('The feedback engine declined this text. Try rephrasing and re-checking.', false)
   }
   const block = (data.content ?? []).find((b: { type: string }) => b.type === 'text')
-  if (!block?.text) throw new Error('Empty analysis response.')
+  if (!block?.text) throw upstreamError(`${MODEL} returned an empty response.`, true)
   return { content: block.text as string, via: MODEL, schemaEnforced: true }
 }
 
 // OpenAI-compatible shape: OpenCode Zen/Go, DeepSeek, OpenRouter, Ollama.
 // No schema enforcement here — the caller's prompt spells the JSON shape out
 // and the client validates on the way back in.
-async function callCompat(system: string, user: string, maxTokens: number) {
-  const res = await fetch(`${COMPAT_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${COMPAT_API_KEY}`,
+async function callCompat(system: string, user: string, maxTokens: number, timeoutMs: number) {
+  const res = await fetchUpstream(
+    `${COMPAT_BASE_URL.replace(/\/$/, '')}/chat/completions`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${COMPAT_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: COMPAT_MODEL,
+        max_tokens: maxTokens,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+      }),
     },
-    body: JSON.stringify({
-      model: COMPAT_MODEL,
-      max_tokens: maxTokens,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-    }),
-  })
-  if (!res.ok) {
-    throw new Error(`${COMPAT_MODEL} ${res.status}: ${(await res.text()).slice(0, 300)}`)
-  }
+    timeoutMs,
+    COMPAT_MODEL
+  )
   const data = await res.json()
   const content = data?.choices?.[0]?.message?.content
-  if (!content) throw new Error(`${COMPAT_MODEL} returned no content.`)
+  if (!content) throw upstreamError(`${COMPAT_MODEL} returned no content.`, true)
   return { content: content as string, via: COMPAT_MODEL, schemaEnforced: false }
 }
 
@@ -153,16 +215,30 @@ Deno.serve(async (req) => {
   const chain = ORDER.filter((p) => (p === 'anthropic' ? hasAnthropic : hasCompat))
   if (!chain.length) return json({ error: 'No model configured on the server.' }, 500)
 
+  const deadline = Date.now() + BUDGET_MS
   const failures: string[] = []
+
   for (const [i, provider] of chain.entries()) {
-    try {
-      const result =
-        provider === 'anthropic'
-          ? await callAnthropic(system, userMsg, maxTokens, body.schema)
-          : await callCompat(system, userMsg, maxTokens)
-      return json({ ...result, fallback: i > 0 })
-    } catch (e) {
-      failures.push((e as Error).message)
+    // Two attempts per provider, the second only for transient failures.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const remaining = deadline - Date.now()
+      if (remaining < MIN_ATTEMPT_MS) {
+        failures.push('ran out of time budget before the platform cut us off')
+        return json({ error: failures.join(' — ') }, 504)
+      }
+      const timeoutMs = Math.min(ATTEMPT_MS, remaining)
+      try {
+        const result =
+          provider === 'anthropic'
+            ? await callAnthropic(system, userMsg, maxTokens, body.schema, timeoutMs)
+            : await callCompat(system, userMsg, maxTokens, timeoutMs)
+        return json({ ...result, fallback: i > 0, retried: attempt > 0 })
+      } catch (e) {
+        const err = e as Upstream
+        failures.push(err.message)
+        if (!err.retryable || attempt === 1) break
+        await sleep(1_200)
+      }
     }
   }
   return json({ error: failures.join(' — ') }, 502)
