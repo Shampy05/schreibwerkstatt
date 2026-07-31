@@ -69,15 +69,24 @@ const hasCompat = Boolean(COMPAT_MODEL && COMPAT_API_KEY && COMPAT_BASE_URL)
 // status, exactly the symptom we are trying to eliminate. Budget for the
 // tightest limit in the chain, not the one we control.
 //
+// The budget is NOT the whole wall clock. Cold-starting the isolate (it imports
+// supabase-js from jsr) and the auth.getUser() round trip both happen before the
+// budget starts counting, and serializing the response happens after it. An
+// 85s attempt inside a 90s budget therefore lands the response somewhere in the
+// low-to-mid 90s — under the 100s limit on paper, and over it whenever the cold
+// start is slow. That configuration was live, and it is what produced the
+// intermittent null-status failures: not a wrong value, an absent margin.
+// 70s of budget leaves ~25s for everything the budget can't see.
+//
 // The ceiling is ENFORCED here, not merely defaulted. These are secrets, and a
-// secret set once outlives the code that wanted it: an ENGINE_BUDGET_MS left
-// over from when the target was Supabase's 150s silently overrides the default
-// and puts us straight back past Cloudflare — where the failure is a null-status
-// CORS error in the browser and nothing at all in our logs, because our code
-// never got to return. A stale or fat-fingered value may make this function
-// give up sooner; it must never let it outlive the proxy. Same for a
-// non-numeric value, which used to become NaN and take every timeout with it.
-const HARD_CEILING_MS = 88_000
+// secret set once outlives the code that wanted it, so a value tuned against an
+// older understanding of the limit silently overrides the default and puts us
+// straight back over — where the failure is a null-status CORS error in the
+// browser and nothing at all in our logs, because our code never got to return.
+// A stale or fat-fingered value may make this function give up sooner; it must
+// never let it outlive the proxy. Same for a non-numeric value, which used to
+// become NaN and take every timeout with it.
+const HARD_CEILING_MS = 75_000
 
 function envMs(name: string, fallback: number, ceiling: number) {
   const raw = Number(Deno.env.get(name) ?? '')
@@ -85,7 +94,7 @@ function envMs(name: string, fallback: number, ceiling: number) {
   return Math.min(value, ceiling)
 }
 
-const BUDGET_MS = envMs('ENGINE_BUDGET_MS', 85_000, HARD_CEILING_MS)
+const BUDGET_MS = envMs('ENGINE_BUDGET_MS', 70_000, HARD_CEILING_MS)
 const ATTEMPT_MS = envMs('ENGINE_ATTEMPT_MS', 55_000, BUDGET_MS)
 const MIN_ATTEMPT_MS = 5_000
 

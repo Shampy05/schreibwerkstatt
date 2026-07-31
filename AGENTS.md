@@ -121,13 +121,15 @@ positional, not provider-specific. `COMPAT_*` secrets are also read under their 
   `verify_jwt = true` alone leaves the function an open proxy on your bill. `index.ts`
   also requires `auth.getUser()` to resolve *and* the email to be in `ALLOWED_EMAILS`,
   because Supabase Auth permits public signup.
-- **The time budget is clamped in code, not just defaulted.** `HARD_CEILING_MS` (88s) wins
-  over `ENGINE_BUDGET_MS`/`ENGINE_ATTEMPT_MS`, because the endpoint sits behind Cloudflare's
-  ~100s read timeout and a 524 from an intermediary carries none of our CORS headers — the
-  browser reports it as "CORS request did not succeed", status null, with *nothing in the
-  function logs*, since our code never returned. A secret set once outlives the code that
-  wanted it, so a stale budget from when the target was Supabase's 150s must not be able to
-  push us back over. Env vars may lower these values; they can never raise them.
+- **The time budget is not the wall clock, and it is clamped in code.** Cold start and
+  `auth.getUser()` run before the budget starts counting and the response is serialized
+  after it, so a budget set close to the limit lands *over* it whenever the cold start is
+  slow. That is what "CORS request did not succeed", status null, means here: Cloudflare's
+  ~100s read timeout fired, its 524 carried none of our CORS headers, and *nothing appears
+  in the function logs* because our code never returned. Measured live: `ENGINE_ATTEMPT_MS`
+  85000 inside `ENGINE_BUDGET_MS` 90000 produced exactly this. `HARD_CEILING_MS` (75s) now
+  wins over both — env vars may lower these values, never raise them — because a secret set
+  once outlives the code that wanted it.
 - **The ledger is derived, not stored.** `buildLedger(sessions)` folds it from sessions,
   oldest-first so rung trajectories read correctly. Don't add a ledger table — that
   creates two sources of truth that drift.
