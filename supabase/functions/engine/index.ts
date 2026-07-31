@@ -42,6 +42,12 @@ const ORDER = CONFIGURED_ORDER.length ? CONFIGURED_ORDER : DEFAULT_ORDER
 
 const MODEL = Deno.env.get('MODEL') ?? 'claude-opus-5'
 const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY') ?? ''
+// JSON mode is an optimisation, not a requirement: the caller spells the JSON
+// shape out in the prompt too, because this path can't enforce a schema either
+// way. Some models are actively harmed by it — glm-5.2 on the OpenCode gateway
+// returns an EMPTY content string when response_format is set, and a perfectly
+// good object when it isn't. Set COMPAT_JSON_MODE=off for those.
+const COMPAT_JSON_MODE = (Deno.env.get('COMPAT_JSON_MODE') ?? 'on').toLowerCase() !== 'off'
 const COMPAT_MODEL = Deno.env.get('COMPAT_MODEL') ?? Deno.env.get('FALLBACK_MODEL') ?? ''
 const COMPAT_API_KEY = Deno.env.get('COMPAT_API_KEY') ?? Deno.env.get('FALLBACK_API_KEY') ?? ''
 const COMPAT_BASE_URL = Deno.env.get('COMPAT_BASE_URL') ?? Deno.env.get('FALLBACK_BASE_URL') ?? ''
@@ -164,7 +170,7 @@ async function callCompat(system: string, user: string, maxTokens: number, timeo
       body: JSON.stringify({
         model: COMPAT_MODEL,
         max_tokens: maxTokens,
-        response_format: { type: 'json_object' },
+        ...(COMPAT_JSON_MODE ? { response_format: { type: 'json_object' } } : {}),
         messages: [
           { role: 'system', content: system },
           { role: 'user', content: user },

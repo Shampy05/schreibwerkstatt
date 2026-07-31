@@ -15,6 +15,7 @@
 
 import { taxonomyPromptBlock, TAXONOMY, CODE_SET, patternFor } from './taxonomy'
 import { parseJsonText } from './jsonText'
+import { redactLeak } from './leakGuard'
 import { analysisLevelBlock, taskLevelBlock } from './level'
 import { stagePromptBlock } from './stage'
 import { supabase, hasSupabase } from './supabase'
@@ -160,7 +161,10 @@ function normalizeErrors(raw, text) {
       // Trust the quote over the model's index when they disagree.
       sentenceIndex: locateSentence(text, e.quote, e.sentence_index),
       patternCode: e.pattern_code,
-      explanation: e.explanation || '',
+      // Rung 4 must not contain rung 5's answer. Every model tested leaks the
+      // correction into the explanation despite being told not to, so redact
+      // rather than trust — see leakGuard.js.
+      explanation: redactLeak(e.explanation || '', e.quote, e.correction || ''),
       correction: e.correction || '',
     })
   }
@@ -185,9 +189,17 @@ export async function analyzeDraft(text, { level } = {}) {
   const { parsed, via, fallback } = await invokeEngine({
     system: `${analysisSystem(level)}\n\n${ANALYSIS_JSON_SHAPE}`,
     user: `Analyze this learner text:\n\n${text}`,
-    // Sized to the capped output above, not to headroom. Generation time is
-    // linear in tokens produced and the request has a hard ceiling.
-    maxTokens: 2048,
+    // Headroom, deliberately. Lowering this to 2048 looked like a latency win
+    // and was not: wall time is dominated by REASONING tokens, and gateways
+    // split two ways on those. grok reports them separately and doesn't charge
+    // them here (585 visible tokens alongside 3,787 of reasoning), so the cap
+    // saved nothing. glm-5.2, kimi-k3 and minimax-m3 fold reasoning into
+    // completion_tokens, so 2048 truncated them mid-thought — finish_reason
+    // "length", empty content, no answer at all — glm-5.2 needed 3,809 of them
+    // to answer at all, uncomfortably close to 4096. The error cap above is
+    // what actually shortens the response; this only needs to be out of the
+    // way, and an unused cap costs nothing. 8192 is the function's own ceiling.
+    maxTokens: 8192,
     schema: ANALYSIS_SCHEMA,
   })
 
@@ -320,7 +332,10 @@ export async function generateTask({
   const { parsed, via } = await invokeEngine({
     system: `${taskSystem(level, stageCeiling)}\n\n${TASK_JSON_SHAPE}`,
     user: `${targetBlock(activeTargets)}${recentBlock}`,
-    maxTokens: 2048,
+    // Same headroom reasoning as analyzeDraft: the visible task is a few
+    // hundred tokens, but on gateways that bill reasoning against max_tokens a
+    // tight cap truncates the model before it writes any of them.
+    maxTokens: 4096,
     schema: TASK_SCHEMA,
   })
 
