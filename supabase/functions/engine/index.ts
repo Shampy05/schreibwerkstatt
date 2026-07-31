@@ -68,8 +68,25 @@ const hasCompat = Boolean(COMPAT_MODEL && COMPAT_API_KEY && COMPAT_BASE_URL)
 // headers, so the browser reports it as a failed CORS request with a null
 // status, exactly the symptom we are trying to eliminate. Budget for the
 // tightest limit in the chain, not the one we control.
-const BUDGET_MS = Number(Deno.env.get('ENGINE_BUDGET_MS') ?? 85_000)
-const ATTEMPT_MS = Number(Deno.env.get('ENGINE_ATTEMPT_MS') ?? 55_000)
+//
+// The ceiling is ENFORCED here, not merely defaulted. These are secrets, and a
+// secret set once outlives the code that wanted it: an ENGINE_BUDGET_MS left
+// over from when the target was Supabase's 150s silently overrides the default
+// and puts us straight back past Cloudflare — where the failure is a null-status
+// CORS error in the browser and nothing at all in our logs, because our code
+// never got to return. A stale or fat-fingered value may make this function
+// give up sooner; it must never let it outlive the proxy. Same for a
+// non-numeric value, which used to become NaN and take every timeout with it.
+const HARD_CEILING_MS = 88_000
+
+function envMs(name: string, fallback: number, ceiling: number) {
+  const raw = Number(Deno.env.get(name) ?? '')
+  const value = Number.isFinite(raw) && raw > 0 ? raw : fallback
+  return Math.min(value, ceiling)
+}
+
+const BUDGET_MS = envMs('ENGINE_BUDGET_MS', 85_000, HARD_CEILING_MS)
+const ATTEMPT_MS = envMs('ENGINE_ATTEMPT_MS', 55_000, BUDGET_MS)
 const MIN_ATTEMPT_MS = 5_000
 
 // Transient upstream conditions worth one immediate retry. We have seen the
@@ -233,15 +250,20 @@ Deno.serve(async (req) => {
   const chain = ORDER.filter((p) => (p === 'anthropic' ? hasAnthropic : hasCompat))
   if (!chain.length) return json({ error: 'No model configured on the server.' }, 500)
 
-  const deadline = Date.now() + BUDGET_MS
+  const started = Date.now()
+  const deadline = started + BUDGET_MS
   const failures: string[] = []
+  // Every failure says how long it took. Without it, "too slow" and "refused
+  // instantly" reach the learner as the same sentence, and the only way to tell
+  // them apart is the dashboard.
+  const elapsed = () => `${((Date.now() - started) / 1000).toFixed(1)}s`
 
   for (const [i, provider] of chain.entries()) {
     // Two attempts per provider, the second only for transient failures.
     for (let attempt = 0; attempt < 2; attempt++) {
       const remaining = deadline - Date.now()
       if (remaining < MIN_ATTEMPT_MS) {
-        failures.push('ran out of time budget before the platform cut us off')
+        failures.push(`gave up after ${elapsed()} to stay inside the platform's limit`)
         return json({ error: failures.join(' — ') }, 504)
       }
       const timeoutMs = Math.min(ATTEMPT_MS, remaining)
@@ -259,5 +281,5 @@ Deno.serve(async (req) => {
       }
     }
   }
-  return json({ error: failures.join(' — ') }, 502)
+  return json({ error: `${failures.join(' — ')} (after ${elapsed()})` }, 502)
 })
